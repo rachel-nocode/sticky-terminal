@@ -23,7 +23,7 @@ pub(crate) struct ThemePalette {
     pub(crate) surface: egui::Color32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub(crate) enum ThemePreset {
     Warp,
     WarpLight,

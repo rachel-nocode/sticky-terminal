@@ -2,14 +2,15 @@ pub(crate) mod clipboard;
 
 use eframe::egui;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use vt100::Parser;
 
-use crate::notes::ParsedMarkdownLine;
-use crate::TERMINAL_SCROLLBACK;
-pub(crate) use clipboard::{install_paste_monitor, read_clipboard, save_clipboard_image, CMD_V_PRESSED};
+use crate::terminal::clipboard::{read_clipboard, save_clipboard_image};
+
+const TERMINAL_SCROLLBACK: usize = 5_000;
 
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalPoint {
@@ -17,7 +18,123 @@ pub(crate) struct TerminalPoint {
     pub(crate) col: u16,
 }
 
+// ── AI Output Pane types ──
+
+pub(crate) struct AiOutputPane {
+    pub(crate) uid: u64,
+    pub(crate) title: String,
+    pub(crate) lines: VecDeque<AiLine>,
+    pub(crate) mirror_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub(crate) source_pane_uid: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct AiLine {
+    pub(crate) text: String,
+    pub(crate) cat: AiLineCategory,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum AiLineCategory {
+    Tool,
+    Edit,
+    Bash,
+    Error,
+    Normal,
+}
+
+impl AiOutputPane {
+    pub(crate) fn drain(&mut self) -> bool {
+        let mut got = false;
+        while let Ok(bytes) = self.mirror_rx.try_recv() {
+            got = true;
+            let clean = strip_ansi(&bytes);
+            for line in clean.split('\n') {
+                let text = line.trim_end_matches('\r').to_owned();
+                if text.is_empty() {
+                    continue;
+                }
+                let cat = classify_ai_line(&text);
+                self.lines.push_back(AiLine { text, cat });
+                if self.lines.len() > 5000 {
+                    self.lines.pop_front();
+                }
+            }
+        }
+        got
+    }
+}
+
+// ── Browser Pane (Feature 8 stub) ──
+
+pub(crate) struct BrowserPane {
+    pub(crate) uid: u64,
+    pub(crate) url_bar: String,
+    pub(crate) current_url: String,
+}
+
+impl BrowserPane {
+    pub(crate) fn new(uid: u64) -> Self {
+        Self {
+            uid,
+            url_bar: "about:blank".to_owned(),
+            current_url: "about:blank".to_owned(),
+        }
+    }
+}
+
+// ── Pane enum ──
+
+pub(crate) enum Pane {
+    Terminal(TerminalPane),
+    AiOutput(AiOutputPane),
+    Browser(BrowserPane),
+}
+
+impl Pane {
+    pub(crate) fn as_terminal(&self) -> Option<&TerminalPane> {
+        if let Pane::Terminal(p) = self { Some(p) } else { None }
+    }
+    pub(crate) fn as_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
+        if let Pane::Terminal(p) = self { Some(p) } else { None }
+    }
+    pub(crate) fn as_ai_output_mut(&mut self) -> Option<&mut AiOutputPane> {
+        if let Pane::AiOutput(p) = self { Some(p) } else { None }
+    }
+    pub(crate) fn drain_output(&mut self) -> bool {
+        match self {
+            Pane::Terminal(p) => p.drain_output(),
+            Pane::AiOutput(p) => p.drain(),
+            Pane::Browser(_) => false,
+        }
+    }
+    pub(crate) fn ensure_started(&mut self) {
+        if let Pane::Terminal(p) = self { p.ensure_started(); }
+    }
+    pub(crate) fn uid(&self) -> u64 {
+        match self {
+            Pane::Terminal(p) => p.uid,
+            Pane::AiOutput(p) => p.uid,
+            Pane::Browser(b) => b.uid,
+        }
+    }
+    pub(crate) fn title(&self) -> &str {
+        match self {
+            Pane::Terminal(p) => &p.title,
+            Pane::AiOutput(p) => &p.title,
+            Pane::Browser(_) => "Browser",
+        }
+    }
+    pub(crate) fn has_focus(&self) -> bool {
+        match self {
+            Pane::Terminal(p) => p.has_focus,
+            _ => false,
+        }
+    }
+}
+
 // ── A single terminal session (pane) ──
+
 pub(crate) struct TerminalPane {
     pub(crate) uid: u64,
     pub(crate) title: String,
@@ -34,26 +151,9 @@ pub(crate) struct TerminalPane {
     pub(crate) selection: Option<(TerminalPoint, TerminalPoint)>,
     pub(crate) paste_chip: Option<String>,
     pub(crate) pending_logs: Vec<String>,
-    pub(crate) font_scale: f32,
+    pub(crate) mirror_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    pub(crate) detected_port: Option<u16>,
 }
-
-// ── A tab containing one or more panes ──
-pub(crate) struct TerminalTab {
-    pub(crate) title: String,
-    pub(crate) panes: Vec<TerminalPane>,
-    pub(crate) active_pane: usize,
-    pub(crate) notes_markdown: String,
-    pub(crate) current_note_file: Option<PathBuf>,
-    pub(crate) note_status: String,
-    pub(crate) editing_notes: bool,
-    pub(crate) notes_dirty: bool,
-    pub(crate) last_type_time: Option<std::time::Instant>,
-    /// Cache for markdown preview: (content_hash, pre-parsed blocks).
-    /// Rebuilt only when the markdown content changes; rendered from each frame.
-    pub(crate) notes_render_cache: Option<(u64, Vec<ParsedMarkdownLine>)>,
-}
-
-// ── TerminalPane implementation ──
 
 impl TerminalPane {
     pub(crate) fn new(uid: u64, cwd: PathBuf) -> Self {
@@ -76,11 +176,12 @@ impl TerminalPane {
             selection: None,
             paste_chip: None,
             pending_logs: Vec::new(),
-            font_scale: 1.0,
+            mirror_tx: None,
+            detected_port: None,
         }
     }
 
-    pub(crate) fn shell_builder(&self) -> CommandBuilder {
+    fn shell_builder(&self) -> CommandBuilder {
         #[cfg(target_os = "windows")]
         {
             let mut command = CommandBuilder::new("cmd.exe");
@@ -144,7 +245,7 @@ impl TerminalPane {
             }
         };
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = [0_u8; 8192];
             loop {
@@ -199,6 +300,14 @@ impl TerminalPane {
         if let Some(rx) = &self.rx {
             while let Ok(bytes) = rx.try_recv() {
                 self.parser.process(&bytes);
+                if let Some(tx) = &self.mirror_tx {
+                    let _ = tx.try_send(bytes.clone());
+                }
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    if let Some(port) = detect_dev_server_port(text) {
+                        self.detected_port = Some(port);
+                    }
+                }
                 received_output = true;
             }
         }
@@ -432,18 +541,18 @@ impl TerminalPane {
                                             .and_then(|n| n.to_str())
                                             .unwrap_or("image")
                                             .to_owned();
-                                        let path_str = if let Some(home) = std::env::var_os("HOME")
-                                        {
-                                            let abs = img_path.to_string_lossy();
-                                            let home_str = home.to_string_lossy();
-                                            if abs.starts_with(home_str.as_ref()) {
-                                                format!("~{}", &abs[home_str.len()..])
+                                        let path_str =
+                                            if let Some(home) = std::env::var_os("HOME") {
+                                                let abs = img_path.to_string_lossy();
+                                                let home_str = home.to_string_lossy();
+                                                if abs.starts_with(home_str.as_ref()) {
+                                                    format!("~{}", &abs[home_str.len()..])
+                                                } else {
+                                                    abs.into_owned()
+                                                }
                                             } else {
-                                                abs.into_owned()
-                                            }
-                                        } else {
-                                            img_path.to_string_lossy().into_owned()
-                                        };
+                                                img_path.to_string_lossy().into_owned()
+                                            };
                                         self.pending_logs
                                             .push(format!("img_paste: pasting path: {path_str}"));
                                         self.paste_chip = Some(filename);
@@ -452,8 +561,9 @@ impl TerminalPane {
                                 }
                                 continue;
                             }
-                            egui::Key::Backspace | egui::Key::ArrowLeft | egui::Key::ArrowRight => {
-                            }
+                            egui::Key::Backspace
+                            | egui::Key::ArrowLeft
+                            | egui::Key::ArrowRight => {}
                             _ => continue,
                         }
                     }
@@ -490,7 +600,7 @@ impl TerminalPane {
 
         if modifiers.alt {
             let alt_bytes = match key {
-                egui::Key::Backspace => Some(vec![0x17]), // Ctrl+W = backward-kill-word
+                egui::Key::Backspace => Some(vec![0x17]),
                 egui::Key::ArrowLeft => Some(b"\x1bb".to_vec()),
                 egui::Key::ArrowRight => Some(b"\x1bf".to_vec()),
                 _ => None,
@@ -603,38 +713,71 @@ impl Drop for TerminalPane {
     }
 }
 
-pub(crate) fn shell_escape_path(path: &Path) -> String {
-    let display = path.to_string_lossy();
-    let escaped = display.replace('\'', "'\\''");
-    format!("'{escaped}'")
+// ── TerminalTab ──
+
+pub(crate) struct TerminalTab {
+    pub(crate) title: String,
+    pub(crate) panes: Vec<Pane>,
+    pub(crate) active_pane: usize,
+    pub(crate) notes_markdown: String,
+    pub(crate) notes_render_cache: Option<String>,
+    pub(crate) current_note_file: Option<PathBuf>,
+    pub(crate) note_status: String,
+    pub(crate) editing_notes: bool,
+    pub(crate) notes_dirty: bool,
+    pub(crate) last_type_time: Option<std::time::Instant>,
 }
 
-// ── TerminalTab implementation ──
+pub(crate) fn default_terminal_cwd() -> PathBuf {
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+
+    let current_dir = std::env::current_dir().ok();
+    if let Some(dir) = current_dir {
+        let launched_from_bundle = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|parent| parent == dir))
+            .unwrap_or(false);
+
+        if dir != PathBuf::from("/") && !launched_from_bundle {
+            return dir;
+        }
+    }
+
+    home_dir.unwrap_or_else(|| PathBuf::from("."))
+}
 
 impl TerminalTab {
     pub(crate) fn new(number: usize, uid: u64, cwd: PathBuf) -> Self {
         Self {
             title: format!("Tab {number}"),
-            panes: vec![TerminalPane::new(uid, cwd)],
+            panes: vec![Pane::Terminal(TerminalPane::new(uid, cwd))],
             active_pane: 0,
             notes_markdown: "# TODO\n- [ ] Keep this shell usable for Codex CLI\n- [ ] Add quick project tabs\n- [ ] Save notes between sessions\n\n## Notes\nWrite markdown on the left.\nUse the right side like a real terminal.".to_owned(),
+            notes_render_cache: None,
             current_note_file: None,
             note_status: "Set your notes folder to start saving notes.".to_owned(),
             editing_notes: false,
             notes_dirty: false,
             last_type_time: None,
-            notes_render_cache: None,
         }
     }
 
-    pub(crate) fn active_pane(&self) -> &TerminalPane {
+    pub(crate) fn active_pane_ref(&self) -> &Pane {
         &self.panes[self.active_pane]
     }
 
+    pub(crate) fn active_pane_mut(&mut self) -> &mut Pane {
+        &mut self.panes[self.active_pane]
+    }
+
     pub(crate) fn split_pane(&mut self, uid: u64) {
-        let cwd = self.panes[self.active_pane].cwd.clone();
+        let cwd = self.panes[self.active_pane]
+            .as_terminal()
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(default_terminal_cwd);
         let insert_at = self.active_pane + 1;
-        self.panes.insert(insert_at, TerminalPane::new(uid, cwd));
+        self.panes
+            .insert(insert_at, Pane::Terminal(TerminalPane::new(uid, cwd)));
         self.active_pane = insert_at;
     }
 
@@ -695,21 +838,70 @@ impl TerminalTab {
     }
 }
 
+// ── Helper free functions ──
 
-pub(crate) fn default_terminal_cwd() -> PathBuf {
-    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
-
-    let current_dir = std::env::current_dir().ok();
-    if let Some(dir) = current_dir {
-        let launched_from_bundle = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|parent| parent == dir))
-            .unwrap_or(false);
-
-        if dir != PathBuf::from("/") && !launched_from_bundle {
-            return dir;
+pub(crate) fn detect_dev_server_port(text: &str) -> Option<u16> {
+    let patterns = [
+        "Listening on :",
+        "localhost:",
+        "127.0.0.1:",
+        "Server running on port ",
+        "started on port ",
+        "running on port ",
+        "listening on port ",
+    ];
+    for pat in patterns {
+        if let Some(pos) = text.to_lowercase().find(&pat.to_lowercase()) {
+            let rest = &text[pos + pat.len()..];
+            let port_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(port) = port_str.parse::<u16>() {
+                if port > 0 {
+                    return Some(port);
+                }
+            }
         }
     }
+    None
+}
 
-    home_dir.unwrap_or_else(|| PathBuf::from("."))
+fn strip_ansi(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else {
+            if let Ok(ch) = std::str::from_utf8(&bytes[i..i + 1]) {
+                out.push_str(ch);
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+fn classify_ai_line(line: &str) -> AiLineCategory {
+    if line.contains("[TOOL]") {
+        AiLineCategory::Tool
+    } else if line.contains("[EDIT]") || line.contains("Writing") || line.contains("Editing") {
+        AiLineCategory::Edit
+    } else if line.contains("[BASH]") || line.contains("Running") || line.contains("Executing") {
+        AiLineCategory::Bash
+    } else if line.contains("[ERROR]") || line.contains("Error") || line.contains("error") {
+        AiLineCategory::Error
+    } else {
+        AiLineCategory::Normal
+    }
+}
+
+pub(crate) fn shell_escape_path(path: &std::path::Path) -> String {
+    let display = path.to_string_lossy();
+    let escaped = display.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }

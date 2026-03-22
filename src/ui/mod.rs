@@ -1,32 +1,43 @@
+pub(crate) mod command_palette;
 pub(crate) mod pane;
-pub(crate) mod tab_bar;
+pub(crate) mod scratchpad;
 pub(crate) mod sidebar;
+pub(crate) mod tab_bar;
 
-use anyhow::Context as _;
 use eframe::egui;
+use rfd::FileDialog;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
-use objc::runtime::Object;
-#[cfg(target_os = "macos")]
-use objc::{class, msg_send, sel, sel_impl};
-
-use rfd::FileDialog;
-
-use crate::config::{migrate_config, AppConfig, CONFIG_VERSION};
-use crate::notes::{hash_string, parse_markdown, ParsedMarkdownLine};
+use crate::config::AppConfig;
 use crate::terminal::{
-    default_terminal_cwd, install_paste_monitor, read_clipboard, save_clipboard_image,
-    CMD_V_PRESSED, TerminalTab,
+    default_terminal_cwd, AiOutputPane, BrowserPane, Pane, TerminalPane, TerminalTab,
 };
+use crate::terminal::clipboard::{install_paste_monitor, read_clipboard, save_clipboard_image, take_cmd_v_pressed};
 use crate::theme::{ThemePalette, ThemePreset};
-use crate::{
-    MINIMIZED_HEIGHT, SIDEBAR_DEFAULT_WIDTH, TAB_BAR_HEIGHT, TOP_BAR_HEIGHT, WINDOW_HEIGHT,
-    WINDOW_WIDTH,
+use crate::watcher::{ChangeKind, FileWatcher};
+
+use self::command_palette::{CommandPaletteState, PaletteAction};
+use self::pane::{
+    find_row_url_spans, open_url, render_pane, render_pane_dispatch, resolve_terminal_color,
 };
+use self::scratchpad::ScratchpadState;
+
+const WINDOW_WIDTH: f32 = 1180.0;
+const WINDOW_HEIGHT: f32 = 760.0;
+const TOP_BAR_HEIGHT: f32 = 40.0;
+const TAB_BAR_HEIGHT: f32 = 38.0;
+const MINIMIZED_HEIGHT: f32 = 40.0;
+const SIDEBAR_DEFAULT_WIDTH: f32 = 340.0;
+const PANE_SEPARATOR_WIDTH: f32 = 1.0;
+const DEBUG_LOG_MAX: usize = 200;
+
+#[derive(Clone, Copy)]
+enum AppSymbol {
+    Privacy,
+}
 
 pub(crate) struct GhostStickiesApp {
     notes_root: Option<PathBuf>,
@@ -42,21 +53,22 @@ pub(crate) struct GhostStickiesApp {
     active_terminal: usize,
     renaming_tab: Option<usize>,
     rename_buffer: String,
-    // Debug log
     debug_log: VecDeque<String>,
     show_debug: bool,
     recent_notes: Vec<PathBuf>,
-    renaming_pane: Option<(usize, usize)>, // (tab_idx, pane_idx)
+    renaming_pane: Option<(usize, usize)>,
     pane_rename_buffer: String,
+    // Feature 3: Scratchpad
+    scratchpad: ScratchpadState,
+    // Feature 7: Command Palette
+    command_palette: CommandPaletteState,
+    // Feature 6: Checkpoints
+    checkpoint_label: String,
+    checkpoints: Vec<(String, String)>,
+    checkpoint_error: Option<String>,
+    // Feature 4: File Watcher
+    file_watcher: Option<FileWatcher>,
     last_error: Option<String>,
-    last_activity: std::time::Instant,
-}
-
-pub(crate) const DEBUG_LOG_MAX: usize = 200;
-
-#[derive(Clone, Copy)]
-pub(crate) enum AppSymbol {
-    Privacy,
 }
 
 impl Default for GhostStickiesApp {
@@ -82,12 +94,16 @@ impl Default for GhostStickiesApp {
             recent_notes: Vec::new(),
             renaming_pane: None,
             pane_rename_buffer: String::new(),
+            scratchpad: ScratchpadState::default(),
+            command_palette: CommandPaletteState::default(),
+            checkpoint_label: String::new(),
+            checkpoints: Vec::new(),
+            checkpoint_error: None,
+            file_watcher: None,
             last_error: None,
-            last_activity: std::time::Instant::now(),
         }
     }
 }
-
 
 impl GhostStickiesApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -106,7 +122,6 @@ impl GhostStickiesApp {
         let image = match symbol {
             AppSymbol::Privacy => egui::include_image!("../../assets/eye.circle.png"),
         };
-
         egui::Image::new(image).fit_to_exact_size(egui::vec2(14.0, 14.0))
     }
 
@@ -147,16 +162,13 @@ impl GhostStickiesApp {
             return;
         };
 
-        let Ok(raw_config) = serde_json::from_str::<AppConfig>(&contents) else {
+        let Ok(config) = serde_json::from_str::<AppConfig>(&contents) else {
             self.terminal_tabs[0].note_status =
                 "Could not read saved settings. Using defaults.".to_owned();
             return;
         };
 
-        let config = migrate_config(raw_config);
-
         self.theme = config.theme;
-        self.sidebar_open = config.sidebar_open;
         self.terminal_tabs[0].current_note_file = config.current_note_file;
         self.recent_notes = config.recent_notes;
 
@@ -169,33 +181,31 @@ impl GhostStickiesApp {
         }
     }
 
-    fn save_config_inner(&self) -> anyhow::Result<()> {
+    fn save_config(&mut self) {
         let ti = self.active_terminal;
         let config = AppConfig {
             notes_root: self.notes_root.clone(),
             current_note_file: self.terminal_tabs[ti].current_note_file.clone(),
             theme: self.theme,
             recent_notes: self.recent_notes.clone(),
-            version: CONFIG_VERSION,
-            sidebar_open: self.sidebar_open,
         };
 
         let support_dir = Self::app_support_dir();
-        fs::create_dir_all(&support_dir)
-            .context("Could not create app settings folder")?;
+        if let Err(err) = fs::create_dir_all(&support_dir) {
+            self.terminal_tabs[ti].note_status =
+                format!("Could not create app settings folder: {err}");
+            return;
+        }
 
-        let contents = serde_json::to_string_pretty(&config)
-            .context("Could not encode settings")?;
-
-        fs::write(Self::config_path(), contents)
-            .context("Could not save settings")?;
-
-        Ok(())
-    }
-
-    fn save_config(&mut self) {
-        if let Err(err) = self.save_config_inner() {
-            self.last_error = Some(format!("Save config failed: {err:#}"));
+        match serde_json::to_string_pretty(&config) {
+            Ok(contents) => {
+                if let Err(err) = fs::write(Self::config_path(), contents) {
+                    self.terminal_tabs[ti].note_status = format!("Could not save settings: {err}");
+                }
+            }
+            Err(err) => {
+                self.terminal_tabs[ti].note_status = format!("Could not encode settings: {err}");
+            }
         }
     }
 
@@ -453,7 +463,6 @@ impl GhostStickiesApp {
         response
     }
 
-    /// Calculate indent level from leading whitespace (each 2 spaces or 1 tab = 1 level)
     fn indent_level(line: &str) -> usize {
         let leading: usize = line
             .chars()
@@ -722,18 +731,14 @@ impl GhostStickiesApp {
         );
     }
 
-    /// Render pre-parsed markdown blocks. Call `parse_markdown()` once when content
-    /// changes and cache the result; call this every frame with the cached slice.
-    /// `markdown` is passed only so interactive checkboxes can toggle lines in-place.
-    fn render_from_blocks(
+    fn render_markdown_preview(
         ui: &mut egui::Ui,
-        blocks: &[ParsedMarkdownLine],
         markdown: &mut String,
         palette: ThemePalette,
         available_height: f32,
     ) -> bool {
         let mut changed = false;
-        let indent_px = 16.0_f32;
+        let indent_px = 16.0;
 
         egui::ScrollArea::vertical()
             .max_height(available_height)
@@ -741,252 +746,209 @@ impl GhostStickiesApp {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
 
-                for block in blocks {
-                    match block {
-                        ParsedMarkdownLine::Empty => {
-                            ui.add_space(6.0);
-                        }
-                        ParsedMarkdownLine::H3(text) => {
-                            ui.add_space(2.0);
-                            Self::markdown_label(ui, text, palette, palette.text, 15.0, false);
-                        }
-                        ParsedMarkdownLine::H2(text) => {
-                            ui.add_space(6.0);
-                            Self::markdown_label(ui, text, palette, palette.text, 17.0, false);
-                            let rule = egui::vec2(ui.available_width().min(160.0), 2.0);
-                            let (rect, _) = ui.allocate_exact_size(rule, egui::Sense::hover());
-                            ui.painter().rect_filled(
-                                rect,
-                                egui::CornerRadius::same(2),
-                                palette.accent.linear_multiply(0.45),
+                let lines: Vec<String> = markdown.lines().map(|s| s.to_owned()).collect();
+                let mut line_idx = 0;
+
+                while line_idx < lines.len() {
+                    let line = &lines[line_idx];
+                    let trimmed = line.trim();
+                    let indent = Self::indent_level(line);
+                    let left_margin = indent as f32 * indent_px;
+
+                    if trimmed.is_empty() {
+                        ui.add_space(6.0);
+                        line_idx += 1;
+                        continue;
+                    }
+
+                    if let Some(heading) = trimmed.strip_prefix("### ") {
+                        ui.add_space(2.0);
+                        Self::markdown_label(ui, heading, palette, palette.text, 15.0, false);
+                    } else if let Some(heading) = trimmed.strip_prefix("## ") {
+                        ui.add_space(6.0);
+                        Self::markdown_label(ui, heading, palette, palette.text, 17.0, false);
+                        let rule = egui::vec2(ui.available_width().min(160.0), 2.0);
+                        let (rect, _) = ui.allocate_exact_size(rule, egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::same(2),
+                            palette.accent.linear_multiply(0.45),
+                        );
+                        ui.add_space(2.0);
+                    } else if let Some(heading) = trimmed.strip_prefix("# ") {
+                        ui.add_space(8.0);
+                        Self::markdown_label(ui, heading, palette, palette.text, 21.0, false);
+                        let rule = egui::vec2(ui.available_width().min(220.0), 2.0);
+                        let (rect, _) = ui.allocate_exact_size(rule, egui::Sense::hover());
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::same(2),
+                            palette.accent.linear_multiply(0.6),
+                        );
+                        ui.add_space(4.0);
+                    } else if trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
+                        let task_text = &trimmed[6..];
+                        ui.horizontal_wrapped(|ui| {
+                            if left_margin > 0.0 {
+                                ui.add_space(left_margin);
+                            }
+                            let mut checked = true;
+                            if Self::markdown_checkbox(ui, &mut checked, palette).changed() {
+                                Self::toggle_line_checkbox(markdown, line_idx, false);
+                                changed = true;
+                            }
+                            Self::markdown_label(
+                                ui,
+                                task_text,
+                                palette,
+                                palette.muted_text,
+                                14.0,
+                                true,
                             );
-                            ui.add_space(2.0);
-                        }
-                        ParsedMarkdownLine::H1(text) => {
-                            ui.add_space(8.0);
-                            Self::markdown_label(ui, text, palette, palette.text, 21.0, false);
-                            let rule = egui::vec2(ui.available_width().min(220.0), 2.0);
-                            let (rect, _) = ui.allocate_exact_size(rule, egui::Sense::hover());
-                            ui.painter().rect_filled(
-                                rect,
-                                egui::CornerRadius::same(2),
-                                palette.accent.linear_multiply(0.6),
+                        });
+                    } else if trimmed.starts_with("- [ ] ") {
+                        let task_text = &trimmed[6..];
+                        ui.horizontal_wrapped(|ui| {
+                            if left_margin > 0.0 {
+                                ui.add_space(left_margin);
+                            }
+                            let mut checked = false;
+                            if Self::markdown_checkbox(ui, &mut checked, palette).changed() {
+                                Self::toggle_line_checkbox(markdown, line_idx, true);
+                                changed = true;
+                            }
+                            Self::markdown_label(ui, task_text, palette, palette.text, 14.0, false);
+                        });
+                    } else if let Some(bullet_text) = trimmed
+                        .strip_prefix("- ")
+                        .or_else(|| trimmed.strip_prefix("* "))
+                    {
+                        ui.horizontal_wrapped(|ui| {
+                            if left_margin > 0.0 {
+                                ui.add_space(left_margin);
+                            }
+                            ui.label(
+                                egui::RichText::new("\u{2022}")
+                                    .size(16.0)
+                                    .color(palette.accent),
                             );
-                            ui.add_space(4.0);
+                            Self::markdown_label(
+                                ui,
+                                bullet_text,
+                                palette,
+                                palette.text,
+                                14.0,
+                                false,
+                            );
+                        });
+                    } else if let Some((number, item_text)) =
+                        trimmed.split_once(". ").filter(|(n, _)| {
+                            !n.is_empty() && n.chars().all(|ch| ch.is_ascii_digit())
+                        })
+                    {
+                        ui.horizontal_wrapped(|ui| {
+                            if left_margin > 0.0 {
+                                ui.add_space(left_margin);
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{number}."))
+                                    .strong()
+                                    .color(palette.accent),
+                            );
+                            Self::markdown_label(
+                                ui,
+                                item_text,
+                                palette,
+                                palette.text,
+                                14.0,
+                                false,
+                            );
+                        });
+                    } else if let Some(quote_text) = trimmed.strip_prefix("> ") {
+                        egui::Frame::NONE
+                            .fill(palette.sidebar_soft_bg.linear_multiply(0.55))
+                            .stroke(egui::Stroke::new(1.0, palette.border))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("\u{258d}")
+                                            .size(18.0)
+                                            .color(palette.accent),
+                                    );
+                                    Self::markdown_label(
+                                        ui,
+                                        quote_text,
+                                        palette,
+                                        palette.muted_text,
+                                        14.0,
+                                        false,
+                                    );
+                                });
+                            });
+                    } else if trimmed.starts_with("```") {
+                        let mut code_lines = Vec::new();
+                        line_idx += 1;
+
+                        while line_idx < lines.len() {
+                            let code_line = &lines[line_idx];
+                            if code_line.trim().starts_with("```") {
+                                break;
+                            }
+                            code_lines.push(code_line.clone());
+                            line_idx += 1;
                         }
-                        ParsedMarkdownLine::CheckedTask { text, line_idx, indent } => {
-                            let left_margin = *indent as f32 * indent_px;
-                            ui.horizontal_wrapped(|ui| {
-                                if left_margin > 0.0 {
-                                    ui.add_space(left_margin);
-                                }
-                                let mut checked = true;
-                                if Self::markdown_checkbox(ui, &mut checked, palette).changed() {
-                                    Self::toggle_line_checkbox(markdown, *line_idx, false);
-                                    changed = true;
-                                }
-                                Self::markdown_label(
-                                    ui,
-                                    text,
-                                    palette,
-                                    palette.muted_text,
-                                    14.0,
-                                    true,
+
+                        let code_block = if code_lines.is_empty() {
+                            " ".to_owned()
+                        } else {
+                            code_lines.join("\n")
+                        };
+
+                        egui::Frame::NONE
+                            .fill(palette.input_bg)
+                            .stroke(egui::Stroke::new(1.0, palette.border))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(code_block)
+                                            .monospace()
+                                            .size(13.0)
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
                                 );
                             });
-                        }
-                        ParsedMarkdownLine::UncheckedTask { text, line_idx, indent } => {
-                            let left_margin = *indent as f32 * indent_px;
+                    } else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                    } else {
+                        if left_margin > 0.0 {
                             ui.horizontal_wrapped(|ui| {
-                                if left_margin > 0.0 {
-                                    ui.add_space(left_margin);
-                                }
-                                let mut checked = false;
-                                if Self::markdown_checkbox(ui, &mut checked, palette).changed() {
-                                    Self::toggle_line_checkbox(markdown, *line_idx, true);
-                                    changed = true;
-                                }
+                                ui.add_space(left_margin);
                                 Self::markdown_label(
                                     ui,
-                                    text,
+                                    trimmed,
                                     palette,
                                     palette.text,
                                     14.0,
                                     false,
                                 );
                             });
-                        }
-                        ParsedMarkdownLine::Bullet { text, indent } => {
-                            let left_margin = *indent as f32 * indent_px;
-                            ui.horizontal_wrapped(|ui| {
-                                if left_margin > 0.0 {
-                                    ui.add_space(left_margin);
-                                }
-                                ui.label(
-                                    egui::RichText::new("\u{2022}")
-                                        .size(16.0)
-                                        .color(palette.accent),
-                                );
-                                Self::markdown_label(ui, text, palette, palette.text, 14.0, false);
-                            });
-                        }
-                        ParsedMarkdownLine::Numbered { num, text, indent } => {
-                            let left_margin = *indent as f32 * indent_px;
-                            ui.horizontal_wrapped(|ui| {
-                                if left_margin > 0.0 {
-                                    ui.add_space(left_margin);
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!("{num}."))
-                                        .strong()
-                                        .color(palette.accent),
-                                );
-                                Self::markdown_label(ui, text, palette, palette.text, 14.0, false);
-                            });
-                        }
-                        ParsedMarkdownLine::Blockquote(text) => {
-                            egui::Frame::NONE
-                                .fill(palette.sidebar_soft_bg.linear_multiply(0.55))
-                                .stroke(egui::Stroke::new(1.0, palette.border))
-                                .corner_radius(egui::CornerRadius::same(8))
-                                .inner_margin(egui::Margin::symmetric(10, 8))
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("\u{258d}")
-                                                .size(18.0)
-                                                .color(palette.accent),
-                                        );
-                                        Self::markdown_label(
-                                            ui,
-                                            text,
-                                            palette,
-                                            palette.muted_text,
-                                            14.0,
-                                            false,
-                                        );
-                                    });
-                                });
-                        }
-                        ParsedMarkdownLine::CodeBlock(code) => {
-                            egui::Frame::NONE
-                                .fill(palette.input_bg)
-                                .stroke(egui::Stroke::new(1.0, palette.border))
-                                .corner_radius(egui::CornerRadius::same(8))
-                                .inner_margin(egui::Margin::same(10))
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(code.as_str())
-                                                .monospace()
-                                                .size(13.0)
-                                                .color(egui::Color32::WHITE),
-                                        )
-                                        .wrap_mode(egui::TextWrapMode::Wrap),
-                                    );
-                                });
-                        }
-                        ParsedMarkdownLine::Rule => {
-                            ui.add_space(4.0);
-                            ui.separator();
-                            ui.add_space(4.0);
-                        }
-                        ParsedMarkdownLine::Paragraph { text, indent } => {
-                            let left_margin = *indent as f32 * indent_px;
-                            if left_margin > 0.0 {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.add_space(left_margin);
-                                    Self::markdown_label(
-                                        ui,
-                                        text,
-                                        palette,
-                                        palette.text,
-                                        14.0,
-                                        false,
-                                    );
-                                });
-                            } else {
-                                Self::markdown_label(ui, text, palette, palette.text, 14.0, false);
-                            }
+                        } else {
+                            Self::markdown_label(ui, trimmed, palette, palette.text, 14.0, false);
                         }
                     }
+
+                    line_idx += 1;
                 }
             });
 
         changed
-    }
-
-    /// Scan one terminal row and return URL spans as (start_col, end_col_inclusive, url).
-    fn find_row_url_spans(screen: &vt100::Screen, row: u16, cols: u16) -> Vec<(u16, u16, String)> {
-        // Build a char→column map so byte positions in the string map back to terminal cols.
-        let mut char_to_col: Vec<u16> = Vec::with_capacity(cols as usize);
-        let mut row_str = String::with_capacity(cols as usize);
-        for col in 0..cols {
-            if let Some(cell) = screen.cell(row, col) {
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-                let content = cell.contents();
-                if content.is_empty() {
-                    char_to_col.push(col);
-                    row_str.push(' ');
-                } else {
-                    for ch in content.chars() {
-                        char_to_col.push(col);
-                        row_str.push(ch);
-                    }
-                }
-            } else {
-                char_to_col.push(col);
-                row_str.push(' ');
-            }
-        }
-
-        let mut spans: Vec<(u16, u16, String)> = Vec::new();
-        let mut search_from = 0usize;
-        loop {
-            let found = ["https://", "http://", "ftp://"]
-                .iter()
-                .filter_map(|p| {
-                    row_str[search_from..]
-                        .find(p)
-                        .map(|pos| (search_from + pos, *p))
-                })
-                .min_by_key(|(pos, _)| *pos);
-            let Some((abs_start, prefix)) = found else {
-                break;
-            };
-            let url_tail = &row_str[abs_start..];
-            let url_end = url_tail
-                .find(|c: char| {
-                    c.is_whitespace() || matches!(c, '"' | '\'' | ')' | ']' | '>' | '<')
-                })
-                .unwrap_or(url_tail.len());
-            if url_end > prefix.len() {
-                let url = url_tail[..url_end].to_string();
-                let start_col = char_to_col.get(abs_start).copied().unwrap_or(0);
-                let end_col = char_to_col
-                    .get(abs_start + url_end - 1)
-                    .copied()
-                    .unwrap_or(start_col);
-                spans.push((start_col, end_col, url));
-                search_from = abs_start + url_end;
-            } else {
-                search_from = abs_start + prefix.len();
-            }
-        }
-        spans
-    }
-
-    fn open_url(url: &str) {
-        #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("open").arg(url).spawn();
-        #[cfg(target_os = "linux")]
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-        #[cfg(target_os = "windows")]
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
     }
 
     fn toggle_line_checkbox(markdown: &mut String, line_index: usize, checked: bool) {
@@ -1016,6 +978,8 @@ impl GhostStickiesApp {
 
     #[cfg(target_os = "macos")]
     fn apply_macos_share_privacy(&self, enabled: bool) {
+        use objc::runtime::Object;
+        use objc::{class, msg_send, sel, sel_impl};
         unsafe {
             let ns_app_class = class!(NSApplication);
             let app: *mut Object = msg_send![ns_app_class, sharedApplication];
@@ -1086,7 +1050,12 @@ impl GhostStickiesApp {
     }
 
     fn add_terminal_tab(&mut self) {
-        let cwd = self.active_tab().active_pane().cwd.clone();
+        let cwd = self.active_tab()
+            .panes
+            .get(self.active_tab().active_pane)
+            .and_then(|p| p.as_terminal())
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(default_terminal_cwd);
         let number = self.next_tab_number;
         self.next_tab_number += 1;
         let uid = self.alloc_pane_uid();
@@ -1186,53 +1155,864 @@ impl GhostStickiesApp {
         self.rename_buffer.clear();
     }
 
-    fn ansi_index_color(index: u8) -> egui::Color32 {
-        match index {
-            0 => egui::Color32::from_rgb(0, 0, 0),
-            1 => egui::Color32::from_rgb(205, 49, 49),
-            2 => egui::Color32::from_rgb(13, 188, 121),
-            3 => egui::Color32::from_rgb(229, 229, 16),
-            4 => egui::Color32::from_rgb(36, 114, 200),
-            5 => egui::Color32::from_rgb(188, 63, 188),
-            6 => egui::Color32::from_rgb(17, 168, 205),
-            7 => egui::Color32::from_rgb(229, 229, 229),
-            8 => egui::Color32::from_rgb(102, 102, 102),
-            9 => egui::Color32::from_rgb(241, 76, 76),
-            10 => egui::Color32::from_rgb(35, 209, 139),
-            11 => egui::Color32::from_rgb(245, 245, 67),
-            12 => egui::Color32::from_rgb(59, 142, 234),
-            13 => egui::Color32::from_rgb(214, 112, 214),
-            14 => egui::Color32::from_rgb(41, 184, 219),
-            15 => egui::Color32::from_rgb(255, 255, 255),
-            16..=231 => {
-                let value = index - 16;
-                let r = value / 36;
-                let g = (value % 36) / 6;
-                let b = value % 6;
-                let channel = |component: u8| {
-                    if component == 0 {
-                        0
+    // Feature 6: Checkpoint methods
+    fn create_checkpoint(&mut self) {
+        let label = self.checkpoint_label.trim().to_owned();
+        if label.is_empty() { return; }
+        let ti = self.active_terminal;
+        let pi = self.terminal_tabs[ti].active_pane;
+        let cwd = self.terminal_tabs[ti].panes.get(pi)
+            .and_then(|p| p.as_terminal())
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(default_terminal_cwd);
+
+        let msg = format!("stickyterminal: {}", label);
+        let result = std::process::Command::new("git")
+            .args(["stash", "push", "--include-untracked", "-m", &msg])
+            .current_dir(&cwd)
+            .output();
+
+        match result {
+            Ok(out) if out.status.success() => {
+                self.checkpoint_error = None;
+                self.checkpoint_label.clear();
+                self.refresh_checkpoints(&cwd.clone());
+            }
+            Ok(out) => {
+                self.checkpoint_error =
+                    Some(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+            }
+            Err(e) => { self.checkpoint_error = Some(e.to_string()); }
+        }
+    }
+
+    fn refresh_checkpoints(&mut self, cwd: &std::path::Path) {
+        let result = std::process::Command::new("git")
+            .args(["stash", "list", "--format=%gd|%s"])
+            .current_dir(cwd)
+            .output();
+        if let Ok(out) = result {
+            if out.status.success() {
+                self.checkpoints = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(2, '|');
+                        let stash_ref = parts.next()?.trim().to_owned();
+                        let subject = parts.next()?.trim().to_owned();
+                        let label = subject
+                            .strip_prefix("stickyterminal: ")
+                            .unwrap_or(&subject)
+                            .to_owned();
+                        Some((label, stash_ref))
+                    })
+                    .take(5)
+                    .collect();
+            }
+        }
+    }
+
+    fn restore_checkpoint(&mut self, stash_ref: String) {
+        let ti = self.active_terminal;
+        let pi = self.terminal_tabs[ti].active_pane;
+        let cwd = self.terminal_tabs[ti].panes.get(pi)
+            .and_then(|p| p.as_terminal())
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(default_terminal_cwd);
+
+        let result = std::process::Command::new("git")
+            .args(["stash", "apply", &stash_ref])
+            .current_dir(&cwd)
+            .output();
+        match result {
+            Ok(out) if !out.status.success() => {
+                self.checkpoint_error =
+                    Some(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+            }
+            Err(e) => { self.checkpoint_error = Some(e.to_string()); }
+            _ => {
+                self.checkpoint_error = None;
+                self.refresh_checkpoints(&cwd.clone());
+            }
+        }
+    }
+
+    // Feature 3: Scratchpad render
+    fn render_scratchpad(&mut self, ctx: &egui::Context, palette: ThemePalette) {
+        if !self.scratchpad.open { return; }
+
+        let mut send = false;
+        let mut close = false;
+
+        egui::Window::new("Prompt Scratchpad")
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .resizable(true)
+            .collapsible(false)
+            .default_size([520.0, 280.0])
+            .frame(
+                egui::Frame::window(ctx.style().as_ref())
+                    .fill(palette.sidebar_bg)
+                    .stroke(egui::Stroke::new(1.0, palette.border)),
+            )
+            .show(ctx, |ui| {
+                if !self.scratchpad.history.is_empty() {
+                    ui.label(egui::RichText::new("Recent").color(palette.muted_text).small());
+                    egui::ScrollArea::vertical()
+                        .max_height(80.0)
+                        .id_salt("scratch_hist")
+                        .show(ui, |ui| {
+                            let mut restore = None;
+                            for (i, entry) in self.scratchpad.history.iter().enumerate() {
+                                let preview = if entry.len() > 60 {
+                                    format!("{}...", &entry[..60])
+                                } else {
+                                    entry.clone()
+                                };
+                                if ui.selectable_label(false, &preview).clicked() {
+                                    restore = Some(i);
+                                }
+                            }
+                            if let Some(i) = restore {
+                                self.scratchpad.buffer = self.scratchpad.history[i].clone();
+                            }
+                        });
+                    ui.separator();
+                }
+
+                let response = ui.add(
+                    egui::TextEdit::multiline(&mut self.scratchpad.buffer)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(6)
+                        .hint_text(
+                            "Type your prompt here... (Enter to send, Shift+Enter for newline)",
+                        ),
+                );
+
+                if self.scratchpad.open {
+                    response.request_focus();
+                }
+
+                if response.has_focus()
+                    && ctx.input(|i| {
+                        i.key_pressed(egui::Key::Enter) && !i.modifiers.shift
+                    })
+                {
+                    send = true;
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button(egui::RichText::new("Send").strong()).clicked() {
+                        send = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if send && !self.scratchpad.buffer.trim().is_empty() {
+            let text = self.scratchpad.buffer.trim().to_owned();
+            self.scratchpad.history.retain(|e| e != &text);
+            self.scratchpad.history.push_front(text.clone());
+            self.scratchpad.history.truncate(20);
+            let ti = self.active_terminal;
+            let pi = self.terminal_tabs[ti].active_pane;
+            if let Some(pane) = self.terminal_tabs[ti].panes.get_mut(pi) {
+                if let Some(term) = pane.as_terminal_mut() {
+                    term.write_bytes(text.as_bytes());
+                    term.write_bytes(b"\r");
+                }
+            }
+            self.scratchpad.buffer.clear();
+            self.scratchpad.open = false;
+        }
+
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.scratchpad.open = false;
+        }
+    }
+
+    // Feature 7: Command Palette render
+    fn render_command_palette(&mut self, ctx: &egui::Context, palette: ThemePalette) {
+        if !self.command_palette.open { return; }
+
+        let mut items: Vec<PaletteAction> = Vec::new();
+        for (i, tab) in self.terminal_tabs.iter().enumerate() {
+            items.push(PaletteAction::SwitchTab(i, tab.title.clone()));
+        }
+        for note in &self.recent_notes.clone() {
+            items.push(PaletteAction::OpenNote(note.clone()));
+        }
+        items.push(PaletteAction::NewTab);
+        items.push(PaletteAction::SplitPane);
+        items.push(PaletteAction::ToggleSidebar);
+        items.push(PaletteAction::SetTheme(ThemePreset::Warp));
+        items.push(PaletteAction::SetTheme(ThemePreset::WarpLight));
+        items.push(PaletteAction::SetTheme(ThemePreset::Terminal));
+        items.push(PaletteAction::SetTheme(ThemePreset::Midnight));
+        items.push(PaletteAction::TogglePrivacy);
+
+        let q = self.command_palette.query.to_lowercase();
+        let filtered: Vec<PaletteAction> = if q.is_empty() {
+            items
+        } else {
+            let mut prefix: Vec<PaletteAction> = items
+                .iter()
+                .filter(|a| a.label().to_lowercase().starts_with(&q))
+                .cloned()
+                .collect();
+            let mut contains: Vec<PaletteAction> = items
+                .iter()
+                .filter(|a| {
+                    !a.label().to_lowercase().starts_with(&q)
+                        && a.label().to_lowercase().contains(&q)
+                })
+                .cloned()
+                .collect();
+            prefix.append(&mut contains);
+            prefix
+        };
+        let visible: Vec<PaletteAction> = filtered.into_iter().take(8).collect();
+
+        if self.command_palette.selected >= visible.len() {
+            self.command_palette.selected = visible.len().saturating_sub(1);
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            self.command_palette.selected = (self.command_palette.selected + 1)
+                .min(visible.len().saturating_sub(1));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            self.command_palette.selected = self.command_palette.selected.saturating_sub(1);
+        }
+
+        let mut execute: Option<PaletteAction> = None;
+        let mut close = false;
+
+        egui::Window::new("##cmd_palette")
+            .title_bar(false)
+            .anchor(
+                egui::Align2::CENTER_TOP,
+                egui::vec2(0.0, TOP_BAR_HEIGHT + TAB_BAR_HEIGHT),
+            )
+            .fixed_size([480.0, 320.0])
+            .frame(
+                egui::Frame::window(ctx.style().as_ref())
+                    .fill(palette.sidebar_bg)
+                    .stroke(egui::Stroke::new(1.5, palette.accent)),
+            )
+            .show(ctx, |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.command_palette.query)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Search tabs, notes, actions...")
+                        .font(egui::TextStyle::Body),
+                );
+                response.request_focus();
+
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (i, action) in visible.iter().enumerate() {
+                        let selected = i == self.command_palette.selected;
+                        let bg = if selected {
+                            palette.accent.linear_multiply(0.2)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let frame = egui::Frame::NONE
+                            .fill(bg)
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(8, 4));
+                        frame.show(ui, |ui| {
+                            let label = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(action.label()).color(if selected {
+                                        palette.accent
+                                    } else {
+                                        palette.text
+                                    }),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if label.clicked() {
+                                execute = Some(action.clone());
+                            }
+                        });
+                    }
+                });
+
+                if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Some(action) = visible.get(self.command_palette.selected) {
+                        execute = Some(action.clone());
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+
+        if let Some(action) = execute {
+            self.command_palette.open = false;
+            self.command_palette.query.clear();
+            match action {
+                PaletteAction::SwitchTab(i, _) => self.switch_terminal_tab(i),
+                PaletteAction::OpenNote(path) => {
+                    let ti = self.active_terminal;
+                    self.terminal_tabs[ti].current_note_file = Some(path);
+                    self.load_current_note();
+                }
+                PaletteAction::NewTab => self.add_terminal_tab(),
+                PaletteAction::SplitPane => {
+                    let ti = self.active_terminal;
+                    let uid = self.alloc_pane_uid();
+                    let pi = self.terminal_tabs[ti].active_pane;
+                    let cwd = self.terminal_tabs[ti].panes[pi]
+                        .as_terminal()
+                        .map(|t| t.cwd.clone())
+                        .unwrap_or_else(default_terminal_cwd);
+                    self.terminal_tabs[ti]
+                        .panes
+                        .push(Pane::Terminal(TerminalPane::new(uid, cwd)));
+                }
+                PaletteAction::ToggleSidebar => self.sidebar_open = !self.sidebar_open,
+                PaletteAction::SetTheme(t) => {
+                    self.theme = t;
+                    self.save_config();
+                }
+                PaletteAction::TogglePrivacy => {
+                    self.privacy_mode = !self.privacy_mode;
+                    // apply_window_mode will be called next frame
+                    self.save_config();
+                }
+            }
+        }
+
+        if close {
+            self.command_palette.open = false;
+        }
+    }
+
+    /// Render the tab bar
+    fn render_tab_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: ThemePalette,
+    ) -> (
+        Option<usize>,
+        Option<usize>,
+        Option<usize>,
+        Option<(usize, usize)>,
+    ) {
+        let mut switch_to = None;
+        let mut close_tab = None;
+        let mut rename_tab = None;
+        let mut move_tab = None;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+
+            for index in 0..self.terminal_tabs.len() {
+                let selected = index == self.active_terminal;
+                let renaming = self.renaming_tab == Some(index);
+
+                if renaming {
+                    let response = ui.add_sized(
+                        [140.0, 28.0],
+                        egui::TextEdit::singleline(&mut self.rename_buffer)
+                            .clip_text(false)
+                            .desired_width(140.0),
+                    );
+
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        self.commit_tab_rename();
+                    }
+
+                    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                        self.cancel_tab_rename();
+                    }
+
+                    response.request_focus();
+                    continue;
+                }
+
+                let (tab_fill, tab_text_color) = if selected {
+                    (palette.active_tab_bg, palette.active_tab_text)
+                } else {
+                    (egui::Color32::TRANSPARENT, palette.tab_text)
+                };
+
+                let tab_label = {
+                    let pane_count = self.terminal_tabs[index].panes.len();
+                    if pane_count > 1 {
+                        format!("{} ({})", self.terminal_tabs[index].title, pane_count)
                     } else {
-                        55 + component * 40
+                        self.terminal_tabs[index].title.clone()
                     }
                 };
-                egui::Color32::from_rgb(channel(r), channel(g), channel(b))
+
+                let tab_frame = egui::Frame::NONE
+                    .fill(tab_fill)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(12, 4));
+
+                let response = tab_frame
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&tab_label)
+                                .size(12.5)
+                                .color(tab_text_color),
+                        );
+                    })
+                    .response;
+
+                let response = response.interact(egui::Sense::click_and_drag());
+
+                if response.clicked() {
+                    switch_to = Some(index);
+                }
+
+                response.context_menu(|ui| {
+                    if ui.button("Rename").clicked() {
+                        rename_tab = Some(index);
+                        ui.close();
+                    }
+
+                    if ui
+                        .add_enabled(self.terminal_tabs.len() > 1, egui::Button::new("Close"))
+                        .clicked()
+                    {
+                        close_tab = Some(index);
+                        ui.close();
+                    }
+                });
+
+                if response.dragged() {
+                    if let Some(pointer_pos) = response.interact_pointer_pos() {
+                        if pointer_pos.x < response.rect.left() && index > 0 {
+                            move_tab = Some((index, index - 1));
+                        } else if pointer_pos.x > response.rect.right()
+                            && index + 1 < self.terminal_tabs.len()
+                        {
+                            move_tab = Some((index, index + 1));
+                        }
+                    }
+                }
             }
-            232..=255 => {
-                let level = 8 + (index - 232) * 10;
-                egui::Color32::from_rgb(level, level, level)
+
+            ui.add_space(4.0);
+            let plus_btn = Self::tab_plus_button(ui, palette);
+            if plus_btn.clicked() {
+                self.add_terminal_tab();
+            }
+            plus_btn.on_hover_text("New tab (Cmd+T)");
+
+            let tab = &self.terminal_tabs[self.active_terminal];
+            if tab.panes.len() > 1 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "pane {}/{}",
+                            tab.active_pane + 1,
+                            tab.panes.len()
+                        ))
+                        .small()
+                        .color(palette.muted_text),
+                    );
+                });
+            }
+        });
+
+        (switch_to, close_tab, rename_tab, move_tab)
+    }
+
+    /// Render all panes in an auto-grid layout with drag-to-swap
+    fn render_panes(&mut self, ui: &mut egui::Ui, palette: ThemePalette, ctx: &egui::Context) {
+        let tab_idx = self.active_terminal;
+        let num_panes = self.terminal_tabs[tab_idx].panes.len();
+        let active_pane_idx = self.terminal_tabs[tab_idx].active_pane;
+
+        if num_panes == 1 {
+            let pane_uid = self.terminal_tabs[tab_idx].panes[0].uid();
+            let pane_id = ui.id().with(("pane_uid", pane_uid));
+            {
+                let pane = &mut self.terminal_tabs[tab_idx].panes[0];
+                render_pane_dispatch(pane, ui, palette, ctx, pane_id, true);
+            }
+            let logs = self.terminal_tabs[tab_idx].panes[0]
+                .as_terminal_mut()
+                .map(|t| std::mem::take(&mut t.pending_logs))
+                .unwrap_or_default();
+            for msg in logs {
+                self.log_debug(msg);
+            }
+            return;
+        }
+
+        let (cols, rows) = Self::grid_dims(num_panes);
+        let total_width = ui.available_width();
+        let total_height = ui.available_height();
+        let gap = PANE_SEPARATOR_WIDTH;
+        let pane_width = (total_width - gap * (cols as f32 - 1.0)) / cols as f32;
+        let pane_height = (total_height - gap * (rows as f32 - 1.0)) / rows as f32;
+
+        let mut pane_rects: Vec<egui::Rect> = Vec::with_capacity(num_panes);
+        let origin = ui.cursor().min;
+
+        for idx in 0..num_panes {
+            let col = idx % cols;
+            let row = idx / cols;
+            let x = origin.x + col as f32 * (pane_width + gap);
+            let y = origin.y + row as f32 * (pane_height + gap);
+            pane_rects.push(egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(pane_width, pane_height),
+            ));
+        }
+
+        let painter = ui.painter();
+        for row in 0..rows {
+            let panes_in_row = if (row + 1) * cols <= num_panes {
+                cols
+            } else {
+                num_panes - row * cols
+            };
+
+            for col in 1..panes_in_row {
+                let x = origin.x + col as f32 * (pane_width + gap) - gap;
+                let y_top = origin.y + row as f32 * (pane_height + gap);
+                let sep_rect =
+                    egui::Rect::from_min_size(egui::pos2(x, y_top), egui::vec2(gap, pane_height));
+                painter.rect_filled(sep_rect, egui::CornerRadius::ZERO, palette.border);
+            }
+
+            if row + 1 < rows {
+                let y = origin.y + (row + 1) as f32 * (pane_height + gap) - gap;
+                let sep_rect = egui::Rect::from_min_size(
+                    egui::pos2(origin.x, y),
+                    egui::vec2(total_width, gap),
+                );
+                painter.rect_filled(sep_rect, egui::CornerRadius::ZERO, palette.border);
+            }
+        }
+
+        const BAR_H: f32 = 24.0;
+
+        let mut pending_focus: Option<usize> = None;
+        let mut pending_swap: Option<(usize, usize)> = None;
+        let mut pending_close: Option<usize> = None;
+        let mut pending_rename_start: Option<(usize, String)> = None;
+        let mut pending_rename_commit = false;
+        let mut pending_rename_cancel = false;
+        let mut create_ai_mirror_for: Option<u64> = None;
+
+        for pane_idx in 0..num_panes {
+            let full_rect = pane_rects[pane_idx];
+            let is_active = pane_idx == active_pane_idx;
+            let pane_uid = self.terminal_tabs[tab_idx].panes[pane_idx].uid();
+            let pane_id = ui.id().with(("pane_uid", pane_uid));
+
+            let bar_rect =
+                egui::Rect::from_min_size(full_rect.min, egui::vec2(full_rect.width(), BAR_H));
+            let content_rect = egui::Rect::from_min_max(
+                egui::pos2(full_rect.min.x, full_rect.min.y + BAR_H),
+                full_rect.max,
+            );
+
+            let bar_bg = if is_active {
+                palette.surface
+            } else {
+                palette.bar_bg
+            };
+            ui.painter()
+                .rect_filled(bar_rect, egui::CornerRadius::ZERO, bar_bg);
+
+            let handle_rect = egui::Rect::from_min_size(
+                egui::pos2(bar_rect.left(), bar_rect.top()),
+                egui::vec2(28.0, BAR_H),
+            );
+            let handle_id = pane_id.with("bar_handle");
+            let handle_resp = ui.interact(handle_rect, handle_id, egui::Sense::click_and_drag());
+            let handle_color = if handle_resp.hovered() || handle_resp.dragged() {
+                palette.accent
+            } else {
+                palette.muted_text.linear_multiply(0.5)
+            };
+            {
+                let cx = handle_rect.center().x;
+                let cy = handle_rect.center().y;
+                let dx = 3.0_f32;
+                let dy = 3.0_f32;
+                let r = 1.2_f32;
+                for row in [-1i32, 0, 1] {
+                    for col in [-1i32, 1] {
+                        ui.painter().circle_filled(
+                            egui::pos2(cx + col as f32 * dx, cy + row as f32 * dy),
+                            r,
+                            handle_color,
+                        );
+                    }
+                }
+            }
+
+            if handle_resp.clicked() {
+                pending_focus = Some(pane_idx);
+            }
+            if handle_resp.drag_started() {
+                let handle_center = handle_rect.center();
+                ui.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("bar_drag_from"), pane_idx);
+                    d.insert_temp(egui::Id::new("bar_drag_origin"), handle_center);
+                });
+            }
+            if handle_resp.drag_stopped() {
+                let from: Option<usize> =
+                    ui.data(|d| d.get_temp(egui::Id::new("bar_drag_from")));
+                if let Some(from_idx) = from {
+                    if let Some(pos) = handle_resp.interact_pointer_pos() {
+                        for (to_idx, to_rect) in pane_rects.iter().enumerate() {
+                            if to_idx != from_idx && to_rect.contains(pos) {
+                                pending_swap = Some((from_idx, to_idx));
+                                break;
+                            }
+                        }
+                    }
+                }
+                ui.data_mut(|d| {
+                    d.remove_by_type::<usize>();
+                    d.remove_by_type::<egui::Pos2>();
+                });
+            }
+
+            let close_btn_size = egui::vec2(BAR_H, BAR_H);
+            let close_rect = egui::Rect::from_min_size(
+                egui::pos2(bar_rect.right() - close_btn_size.x, bar_rect.top()),
+                close_btn_size,
+            );
+            let close_id = pane_id.with("bar_close");
+            let close_resp = ui.interact(close_rect, close_id, egui::Sense::click());
+            let close_color = if close_resp.hovered() {
+                egui::Color32::from_rgb(220, 80, 80)
+            } else {
+                palette.muted_text.linear_multiply(0.5)
+            };
+            ui.painter().text(
+                close_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "×",
+                egui::FontId::proportional(14.0),
+                close_color,
+            );
+            if close_resp.clicked() {
+                pending_close = Some(pane_idx);
+            }
+
+            let title_rect = egui::Rect::from_min_max(
+                egui::pos2(bar_rect.left() + 28.0, bar_rect.top()),
+                egui::pos2(bar_rect.right() - close_btn_size.x, bar_rect.bottom()),
+            );
+            let is_renaming = self.renaming_pane == Some((tab_idx, pane_idx));
+
+            if is_renaming {
+                let rename_id = pane_id.with("bar_rename_edit");
+                let mut rename_ui =
+                    ui.new_child(egui::UiBuilder::new().max_rect(title_rect.shrink(2.0)));
+                let edit_resp = rename_ui.add(
+                    egui::TextEdit::singleline(&mut self.pane_rename_buffer)
+                        .id(rename_id)
+                        .desired_width(title_rect.width() - 4.0)
+                        .font(egui::TextStyle::Small)
+                        .frame(false),
+                );
+                edit_resp.request_focus();
+                let pressed_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                let pressed_esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+                if pressed_esc {
+                    pending_rename_cancel = true;
+                } else if pressed_enter {
+                    pending_rename_commit = true;
+                } else if edit_resp.lost_focus() {
+                    pending_rename_commit = true;
+                }
+            } else {
+                let current_title =
+                    self.terminal_tabs[tab_idx].panes[pane_idx].title().to_owned();
+                let display_title = if current_title.is_empty() {
+                    format!("Terminal {}", pane_idx + 1)
+                } else {
+                    current_title.clone()
+                };
+                let title_color = if is_active {
+                    palette.text
+                } else {
+                    palette.muted_text
+                };
+                let title_id = pane_id.with("bar_title");
+                let title_resp = ui.interact(title_rect, title_id, egui::Sense::click());
+                ui.painter().text(
+                    title_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &display_title,
+                    egui::FontId::proportional(11.0),
+                    title_color,
+                );
+                if title_resp.double_clicked() {
+                    pending_rename_start = Some((pane_idx, display_title));
+                }
+                if title_resp.clicked() {
+                    pending_focus = Some(pane_idx);
+                }
+                // Context menu: "Mirror as AI Panel"
+                let is_terminal_pane = self.terminal_tabs[tab_idx].panes[pane_idx]
+                    .as_terminal()
+                    .is_some();
+                if is_terminal_pane {
+                    title_resp.context_menu(|ui| {
+                        if ui.button("Mirror as AI Panel").clicked() {
+                            create_ai_mirror_for = Some(pane_uid);
+                            ui.close();
+                        }
+                    });
+                }
+            }
+
+            let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
+            child_ui.set_clip_rect(content_rect);
+
+            {
+                let pane = &mut self.terminal_tabs[tab_idx].panes[pane_idx];
+                render_pane_dispatch(pane, &mut child_ui, palette, ctx, pane_id, is_active);
+            }
+            let logs = self.terminal_tabs[tab_idx].panes[pane_idx]
+                .as_terminal_mut()
+                .map(|t| std::mem::take(&mut t.pending_logs))
+                .unwrap_or_default();
+            for msg in logs {
+                self.log_debug(msg);
+            }
+
+            let pane_has_focus = self.terminal_tabs[tab_idx].panes[pane_idx].has_focus();
+            let pane_uid_for_log = self.terminal_tabs[tab_idx].panes[pane_idx].uid();
+            if pane_has_focus && !is_active {
+                let old_active = self.terminal_tabs[tab_idx].active_pane;
+                self.terminal_tabs[tab_idx].active_pane = pane_idx;
+                self.log_debug(format!(
+                    "focus_change: pane {old_active} -> {pane_idx} (uid={})",
+                    pane_uid_for_log
+                ));
+            }
+        }
+
+        // Draw drag line
+        {
+            let from: Option<usize> = ui.data(|d| d.get_temp(egui::Id::new("bar_drag_from")));
+            if from.is_some() {
+                if let Some(origin_pos) =
+                    ui.data(|d| d.get_temp::<egui::Pos2>(egui::Id::new("bar_drag_origin")))
+                {
+                    if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
+                        ui.painter().line_segment(
+                            [origin_pos, ptr],
+                            egui::Stroke::new(1.5, palette.accent.linear_multiply(0.55)),
+                        );
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+
+        if let Some((pane_idx, current)) = pending_rename_start {
+            self.renaming_pane = Some((tab_idx, pane_idx));
+            self.pane_rename_buffer = current;
+        }
+        if pending_rename_commit {
+            if let Some((t, p)) = self.renaming_pane {
+                let new_title = self.pane_rename_buffer.trim().to_owned();
+                if let Some(term) = self.terminal_tabs[t].panes[p].as_terminal_mut() {
+                    term.title = new_title;
+                }
+            }
+            self.renaming_pane = None;
+        }
+        if pending_rename_cancel {
+            self.renaming_pane = None;
+        }
+
+        if let Some(pane_idx) = pending_focus {
+            self.terminal_tabs[tab_idx].active_pane = pane_idx;
+        }
+        if let Some((from, to)) = pending_swap {
+            let from_uid = self.terminal_tabs[tab_idx].panes[from].uid();
+            let to_uid = self.terminal_tabs[tab_idx].panes[to].uid();
+            self.terminal_tabs[tab_idx].panes.swap(from, to);
+            let active = self.terminal_tabs[tab_idx].active_pane;
+            if active == from {
+                self.terminal_tabs[tab_idx].active_pane = to;
+            } else if active == to {
+                self.terminal_tabs[tab_idx].active_pane = from;
+            }
+            self.log_debug(format!(
+                "bar_swap: {from}(uid={from_uid}) <-> {to}(uid={to_uid})"
+            ));
+        }
+        if let Some(close_idx) = pending_close {
+            let before = self.terminal_tabs[tab_idx].panes.len();
+            self.terminal_tabs[tab_idx].close_pane(close_idx);
+            self.log_debug(format!(
+                "bar_close: pane {close_idx}, {before} -> {} panes",
+                self.terminal_tabs[tab_idx].panes.len()
+            ));
+            if self.renaming_pane == Some((tab_idx, close_idx)) {
+                self.renaming_pane = None;
+            }
+        }
+
+        // Feature 2: Create AI mirror pane
+        if let Some(source_uid) = create_ai_mirror_for {
+            let (tx, rx) = std::sync::mpsc::sync_channel(256);
+            for pane in &mut self.terminal_tabs[tab_idx].panes {
+                if pane.uid() == source_uid {
+                    if let Some(term) = pane.as_terminal_mut() {
+                        term.mirror_tx = Some(tx);
+                    }
+                    break;
+                }
+            }
+            let uid = self.alloc_pane_uid();
+            let ai_pane = AiOutputPane {
+                uid,
+                title: format!("AI Output (pane {})", source_uid),
+                lines: std::collections::VecDeque::new(),
+                mirror_rx: rx,
+                source_pane_uid: source_uid,
+            };
+            self.terminal_tabs[tab_idx].panes.push(Pane::AiOutput(ai_pane));
+        }
+
+        let grid_rect = egui::Rect::from_min_size(
+            origin,
+            egui::vec2(total_width, rows as f32 * (pane_height + gap) - gap),
+        );
+        ui.allocate_rect(grid_rect, egui::Sense::hover());
+    }
+
+    fn grid_dims(n: usize) -> (usize, usize) {
+        match n {
+            0 | 1 => (1, 1),
+            2 => (2, 1),
+            3 => (3, 1),
+            4 => (2, 2),
+            5 | 6 => (3, 2),
+            7..=9 => (3, 3),
+            10..=12 => (4, 3),
+            _ => {
+                let cols = (n as f32).sqrt().ceil() as usize;
+                let rows = (n + cols - 1) / cols;
+                (cols, rows)
             }
         }
     }
-
-    fn resolve_terminal_color(color: vt100::Color, default_color: egui::Color32) -> egui::Color32 {
-        match color {
-            vt100::Color::Default => default_color,
-            vt100::Color::Idx(index) => Self::ansi_index_color(index),
-            vt100::Color::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
-        }
-    }
-
 }
 
 impl eframe::App for GhostStickiesApp {
@@ -1243,28 +2023,10 @@ impl eframe::App for GhostStickiesApp {
 
         self.apply_window_mode(ctx);
 
-        // ── Error toast ──
-        if let Some(err) = self.last_error.clone() {
-            egui::Window::new("⚠ Error")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.label(&err);
-                    if ui.button("Dismiss").clicked() {
-                        self.last_error = None;
-                    }
-                });
-        }
-
-        // ── App-level paste detection (runs regardless of pane focus state) ──
+        // ── App-level paste detection ──
         {
-            // CMD_V_PRESSED is set by the low-level NSEvent monitor in install_paste_monitor().
-            // It fires even when macOS suppresses the Cmd+V key event from reaching egui
-            // (which happens when the clipboard contains only image data).
-            let nsevent_cmd_v = CMD_V_PRESSED.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let nsevent_cmd_v = take_cmd_v_pressed();
 
-            // Also watch for egui-level paste events (text paste path).
             let all_events = ctx.input(|i| i.events.clone());
             for e in &all_events {
                 if let egui::Event::Paste(t) = e {
@@ -1275,8 +2037,6 @@ impl eframe::App for GhostStickiesApp {
                 self.log_debug("app_paste: NSEvent Cmd+V detected".to_owned());
             }
 
-            // Only attempt image paste when Cmd+V came from the low-level monitor
-            // AND there is no text in the clipboard (image-only case).
             if nsevent_cmd_v {
                 let has_text = read_clipboard().map(|t| !t.is_empty()).unwrap_or(false);
                 self.log_debug(format!("app_paste: has_text={has_text}"));
@@ -1292,7 +2052,6 @@ impl eframe::App for GhostStickiesApp {
                             .and_then(|n| n.to_str())
                             .unwrap_or("image")
                             .to_owned();
-                        // Shorten path for terminal display: replace $HOME prefix with ~
                         let path_str = if let Some(home) = std::env::var_os("HOME") {
                             let abs = img_path.to_string_lossy();
                             let home_str = home.to_string_lossy();
@@ -1305,10 +2064,14 @@ impl eframe::App for GhostStickiesApp {
                             img_path.to_string_lossy().into_owned()
                         };
                         self.log_debug(format!("app_paste: saved → {path_str}"));
-                        self.terminal_tabs[ti].panes[pi].paste_chip = Some(filename);
-                        self.terminal_tabs[ti].panes[pi].paste_text(&path_str);
+                        if let Some(term) = self.terminal_tabs[ti].panes[pi].as_terminal_mut() {
+                            term.paste_chip = Some(filename);
+                            term.paste_text(&path_str);
+                        }
                     } else {
-                        self.log_debug("app_paste: save_clipboard_image returned None".to_owned());
+                        self.log_debug(
+                            "app_paste: save_clipboard_image returned None".to_owned(),
+                        );
                     }
                     for msg in img_logs {
                         self.log_debug(msg);
@@ -1324,13 +2087,14 @@ impl eframe::App for GhostStickiesApp {
         let split_pane =
             ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::D));
         let close_pane = ctx.input(|input| {
-            input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::D)
+            input.modifiers.command
+                && input.modifiers.shift
+                && input.key_pressed(egui::Key::D)
         });
         let next_pane = ctx
             .input(|input| input.modifiers.command && input.key_pressed(egui::Key::CloseBracket));
         let prev_pane =
             ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::OpenBracket));
-        // Cmd+Shift+Arrow to move/swap the active pane in the grid
         let move_pane_left = ctx.input(|input| {
             input.modifiers.command
                 && input.modifiers.shift
@@ -1355,13 +2119,17 @@ impl eframe::App for GhostStickiesApp {
             input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::L)
         });
 
-        let zoom_in = ctx.input(|i| {
-            i.modifiers.command && i.key_pressed(egui::Key::Equals)
-        });
-        let zoom_out =
-            ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Minus));
-        let zoom_reset =
-            ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Num0));
+        // Feature 3: Scratchpad toggle (Cmd+P)
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            self.scratchpad.open = !self.scratchpad.open;
+        }
+
+        // Feature 7: Command Palette toggle (Cmd+K)
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.command_palette.open = !self.command_palette.open;
+            self.command_palette.query.clear();
+            self.command_palette.selected = 0;
+        }
 
         let mut received_output = false;
         for tab in &mut self.terminal_tabs {
@@ -1370,18 +2138,17 @@ impl eframe::App for GhostStickiesApp {
                 received_output = true;
             }
         }
-
-        let had_input = ctx.input(|i| !i.events.is_empty());
-        if received_output || had_input {
-            self.last_activity = std::time::Instant::now();
-            ctx.request_repaint();
-        } else if self.last_activity.elapsed() < Duration::from_millis(500) {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        } else {
-            ctx.request_repaint_after(Duration::from_millis(200));
+        // Feature 4: drain file watcher
+        if let Some(watcher) = &mut self.file_watcher {
+            if watcher.drain() {
+                received_output = true;
+            }
         }
+        if received_output {
+            ctx.request_repaint();
+        }
+        ctx.request_repaint_after(Duration::from_millis(16));
 
-        // Autosave notes after 1.5 s of inactivity
         let ti = self.active_terminal;
         if self.terminal_tabs[ti].notes_dirty {
             if let Some(t) = self.terminal_tabs[ti].last_type_time {
@@ -1427,7 +2194,6 @@ impl eframe::App for GhostStickiesApp {
             self.log_debug(format!("focus_prev_pane: {before} -> {after}"));
         }
 
-        // Move active pane in the grid
         let mut kbd_swap: Option<(usize, usize)> = None;
         {
             let tab = self.active_tab_mut();
@@ -1468,20 +2234,6 @@ impl eframe::App for GhostStickiesApp {
         if toggle_debug {
             self.show_debug = !self.show_debug;
             self.log_debug(format!("debug window toggled: {}", self.show_debug));
-        }
-
-        if let Some(tab) = self.terminal_tabs.get_mut(self.active_terminal) {
-            if let Some(pane) = tab.panes.get_mut(tab.active_pane) {
-                if zoom_in {
-                    pane.font_scale = (pane.font_scale + 0.1).min(2.5);
-                }
-                if zoom_out {
-                    pane.font_scale = (pane.font_scale - 0.1).max(0.5);
-                }
-                if zoom_reset {
-                    pane.font_scale = 1.0;
-                }
-            }
         }
 
         let palette = self.theme.palette();
@@ -1532,7 +2284,6 @@ impl eframe::App for GhostStickiesApp {
                     start_drag = true;
                 }
 
-                // Draw "StickyTerminal" centered over the bar (painted before layout so it's behind controls)
                 ui.painter().text(
                     ui.max_rect().center(),
                     egui::Align2::CENTER_CENTER,
@@ -1542,7 +2293,6 @@ impl eframe::App for GhostStickiesApp {
                 );
 
                 ui.horizontal(|ui| {
-                    // Traffic light buttons
                     let dot_size = egui::vec2(12.0, 12.0);
 
                     let (close_rect, close_resp) =
@@ -1597,7 +2347,6 @@ impl eframe::App for GhostStickiesApp {
 
                     ui.add_space(16.0);
 
-                    // Sidebar toggle
                     let sidebar_icon_color = if self.sidebar_open {
                         palette.accent
                     } else {
@@ -1620,10 +2369,27 @@ impl eframe::App for GhostStickiesApp {
                         .clicked()
                     {
                         self.sidebar_open = !self.sidebar_open;
-                        self.save_config();
                     }
 
                     ui.add_space(12.0);
+
+                    // Feature 8: New Browser Pane button
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("B").size(11.0).color(palette.muted_text),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("New Browser Pane")
+                        .clicked()
+                    {
+                        let uid = self.alloc_pane_uid();
+                        let ti = self.active_terminal;
+                        self.terminal_tabs[ti]
+                            .panes
+                            .push(Pane::Browser(BrowserPane::new(uid)));
+                    }
 
                     ui.add_space(8.0);
 
@@ -1667,7 +2433,8 @@ impl eframe::App for GhostStickiesApp {
                             |ui| {
                                 for preset in ThemePreset::ALL {
                                     let label = if self.theme == preset {
-                                        egui::RichText::new(preset.label()).color(palette.accent)
+                                        egui::RichText::new(preset.label())
+                                            .color(palette.accent)
                                     } else {
                                         egui::RichText::new(preset.label()).color(palette.text)
                                     };
@@ -1690,7 +2457,6 @@ impl eframe::App for GhostStickiesApp {
         if privacy_toggled {
             self.privacy_mode = !self.privacy_mode;
             self.apply_window_mode(ctx);
-            self.save_config();
         }
 
         if quit_requested {
@@ -1714,7 +2480,8 @@ impl eframe::App for GhostStickiesApp {
                     .inner_margin(egui::Margin::symmetric(10, 4)),
             )
             .show(ctx, |ui| {
-                let (switch_to, close_tab, rename_tab, move_tab) = self.render_tab_bar(ui, palette);
+                let (switch_to, close_tab, rename_tab, move_tab) =
+                    self.render_tab_bar(ui, palette);
 
                 if let Some((from, to)) = move_tab {
                     self.move_terminal_tab(from, to);
@@ -1766,7 +2533,6 @@ impl eframe::App for GhostStickiesApp {
                         })
                         .unwrap_or_else(|| "No note selected".to_owned());
 
-                    // Header row
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new("Notes")
@@ -1799,7 +2565,6 @@ impl eframe::App for GhostStickiesApp {
                     });
                     ui.add_space(4.0);
 
-                    // File controls
                     Self::note_surface_frame(palette).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -1824,21 +2589,25 @@ impl eframe::App for GhostStickiesApp {
                                     {
                                         let recent_copy = self.recent_notes.clone();
                                         if !recent_copy.is_empty() {
-                                            let _ = egui::containers::menu::MenuButton::from_button(
-                                                Self::note_action_button("Recent", palette),
-                                            )
-                                            .ui(ui, |ui| {
-                                                for path in &recent_copy {
-                                                    let name = path
-                                                        .file_name()
-                                                        .and_then(|n| n.to_str())
-                                                        .unwrap_or("?");
-                                                    if ui.selectable_label(false, name).clicked() {
-                                                        open_recent_note = Some(path.clone());
-                                                        ui.close();
+                                            let _ =
+                                                egui::containers::menu::MenuButton::from_button(
+                                                    Self::note_action_button("Recent", palette),
+                                                )
+                                                .ui(ui, |ui| {
+                                                    for path in &recent_copy {
+                                                        let name = path
+                                                            .file_name()
+                                                            .and_then(|n| n.to_str())
+                                                            .unwrap_or("?");
+                                                        if ui
+                                                            .selectable_label(false, name)
+                                                            .clicked()
+                                                        {
+                                                            open_recent_note = Some(path.clone());
+                                                            ui.close();
+                                                        }
                                                     }
-                                                }
-                                            });
+                                                });
                                         }
                                     }
                                     if ui
@@ -1855,7 +2624,8 @@ impl eframe::App for GhostStickiesApp {
                     ui.add_space(6.0);
 
                     let status_height = 20.0;
-                    let content_height = (ui.available_height() - status_height - 8.0).max(100.0);
+                    let content_height =
+                        (ui.available_height() - status_height - 8.0).max(100.0);
 
                     Self::note_surface_frame(palette).show(ui, |ui| {
                         if self.terminal_tabs[ti].editing_notes {
@@ -1869,53 +2639,22 @@ impl eframe::App for GhostStickiesApp {
                                         )
                                         .desired_width(ui.available_width())
                                         .desired_rows(40)
-                                        .hint_text("Write markdown here. Cmd+L to add a checkbox."),
+                                        .hint_text(
+                                            "Write markdown here. Cmd+L to add a checkbox.",
+                                        ),
                                     );
                                     if r.changed() {
                                         text_edit_changed = true;
                                     }
                                 });
                         } else {
-                            // Rebuild the parsed-block cache only when content changes.
-                            {
-                                let current_hash =
-                                    hash_string(&self.terminal_tabs[ti].notes_markdown);
-                                let cache_valid = self.terminal_tabs[ti]
-                                    .notes_render_cache
-                                    .as_ref()
-                                    .map(|(h, _)| *h == current_hash)
-                                    .unwrap_or(false);
-                                if !cache_valid {
-                                    let parsed =
-                                        parse_markdown(&self.terminal_tabs[ti].notes_markdown);
-                                    self.terminal_tabs[ti].notes_render_cache =
-                                        Some((current_hash, parsed));
-                                }
-                            }
-                            // Render from the cached blocks. Use field destructuring so the
-                            // borrow checker can see that `notes_render_cache` (read) and
-                            // `notes_markdown` (write, for checkbox toggles) are disjoint.
-                            let preview_changed = {
-                                let tab = &mut self.terminal_tabs[ti];
-                                let TerminalTab {
-                                    ref notes_render_cache,
-                                    ref mut notes_markdown,
-                                    ..
-                                } = *tab;
-                                let blocks =
-                                    notes_render_cache.as_ref().unwrap().1.as_slice();
-                                Self::render_from_blocks(
-                                    ui,
-                                    blocks,
-                                    notes_markdown,
-                                    palette,
-                                    content_height,
-                                )
-                                // `blocks` drops here; borrow of notes_render_cache ends.
-                            };
+                            let preview_changed = Self::render_markdown_preview(
+                                ui,
+                                &mut self.terminal_tabs[ti].notes_markdown,
+                                palette,
+                                content_height,
+                            );
                             if preview_changed {
-                                // Invalidate cache so it is rebuilt with updated checkboxes.
-                                self.terminal_tabs[ti].notes_render_cache = None;
                                 save_note = true;
                             }
                         }
@@ -1954,6 +2693,132 @@ impl eframe::App for GhostStickiesApp {
                         let ti = self.active_terminal;
                         self.terminal_tabs[ti].notes_dirty = true;
                         self.terminal_tabs[ti].last_type_time = Some(std::time::Instant::now());
+                    }
+
+                    // Feature 6: Checkpoints section
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new("Checkpoints")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if let Some(err) = &self.checkpoint_error.clone() {
+                                ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.checkpoint_label)
+                                        .hint_text("label...")
+                                        .desired_width(ui.available_width() - 52.0),
+                                );
+                                if ui.button("Save").clicked() {
+                                    self.create_checkpoint();
+                                }
+                            });
+                            let to_restore = {
+                                let mut r = None;
+                                for (label, stash_ref) in &self.checkpoints.clone() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(label)
+                                                .small()
+                                                .color(palette.text),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.small_button("Restore").clicked() {
+                                                    r = Some(stash_ref.clone());
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                                r
+                            };
+                            if let Some(stash_ref) = to_restore {
+                                self.restore_checkpoint(stash_ref);
+                            }
+                        });
+
+                    // Feature 4: File Changes section
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new("File Changes")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            if self.file_watcher.is_none() {
+                                if ui.button("Watch workspace...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        match FileWatcher::start(path) {
+                                            Ok(w) => self.file_watcher = Some(w),
+                                            Err(e) => self.last_error = Some(e.to_string()),
+                                        }
+                                    }
+                                }
+                                if let Some(err) = &self.last_error.clone() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 100, 100),
+                                        err,
+                                    );
+                                }
+                            } else if let Some(watcher) = &self.file_watcher {
+                                let watched = watcher.watched_path.clone();
+                                let changes: Vec<_> =
+                                    watcher.recent_changes.iter().cloned().collect();
+                                if changes.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("Watching for changes...")
+                                            .color(palette.muted_text)
+                                            .small(),
+                                    );
+                                }
+                                for change in &changes {
+                                    let (icon, color) = match change.kind {
+                                        ChangeKind::Created => (
+                                            "+",
+                                            egui::Color32::from_rgb(100, 220, 100),
+                                        ),
+                                        ChangeKind::Modified => ("~", palette.accent),
+                                        ChangeKind::Deleted => (
+                                            "-",
+                                            egui::Color32::from_rgb(220, 100, 100),
+                                        ),
+                                    };
+                                    let rel = change
+                                        .path
+                                        .strip_prefix(&watched)
+                                        .unwrap_or(&change.path);
+                                    let name = rel.display().to_string();
+                                    ui.colored_label(color, format!("{} {}", icon, name));
+                                }
+                                if ui.small_button("Stop watching").clicked() {
+                                    self.file_watcher = None;
+                                }
+                            }
+                        });
+
+                    // Feature 5: Smart Context Snippets — drop files into sidebar
+                    let any_pane_focused =
+                        self.terminal_tabs[ti].panes.iter().any(|p| p.has_focus());
+                    if !any_pane_focused {
+                        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+                        for file in &dropped_files {
+                            if let Some(path) = &file.path {
+                                if let Ok(contents) = std::fs::read_to_string(path) {
+                                    let ext = path
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("");
+                                    let snippet =
+                                        format!("\n\n```{}\n{}\n```\n", ext, contents);
+                                    self.terminal_tabs[ti]
+                                        .notes_markdown
+                                        .push_str(&snippet);
+                                    self.terminal_tabs[ti].notes_dirty = true;
+                                    self.terminal_tabs[ti].notes_render_cache = None;
+                                    self.terminal_tabs[ti].last_type_time =
+                                        Some(std::time::Instant::now());
+                                }
+                            }
+                        }
                     }
                 });
         }
@@ -2002,6 +2867,12 @@ impl eframe::App for GhostStickiesApp {
             .show(ctx, |ui| {
                 self.render_panes(ui, palette, ctx);
             });
+
+        // Feature 3: Scratchpad window
+        self.render_scratchpad(ctx, palette);
+
+        // Feature 7: Command Palette window
+        self.render_command_palette(ctx, palette);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

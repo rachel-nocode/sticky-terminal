@@ -1,27 +1,17 @@
 use std::path::PathBuf;
 
-pub(crate) static CMD_V_PRESSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CMD_V_PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-// ── Low-level Cmd+V detection via NSEvent local monitor ─────────────────────
-//
-// macOS routes Cmd+V through the `paste:` responder action. For text on the
-// clipboard that generates Event::Paste in egui. For image-only clipboard
-// content the action finds no text and egui sees *nothing*. We install an
-// NSEvent local key-down monitor that fires before any responder processing,
-// so we can detect Cmd+V independently of clipboard content.
-//
-// The monitor callback is an Objective-C block. We implement the block ABI
-// manually (a "global block" with no captures) to avoid a new crate dependency.
+#[cfg(target_os = "macos")]
+use objc::runtime::Object;
+#[cfg(target_os = "macos")]
+use objc::{class, msg_send, sel, sel_impl};
 
 #[cfg(target_os = "macos")]
 pub(crate) fn install_paste_monitor() {
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
     use std::sync::OnceLock;
 
     extern "C" {
-        // Linker symbol; value is the vtable pointer for global ObjC blocks.
         static _NSConcreteGlobalBlock: std::ffi::c_void;
     }
 
@@ -31,7 +21,6 @@ pub(crate) fn install_paste_monitor() {
         size: u64,
     }
 
-    // Matches the Clang block ABI layout for a block with no captured variables.
     #[repr(C)]
     struct GlobalBlock {
         isa: *const std::ffi::c_void,
@@ -41,18 +30,12 @@ pub(crate) fn install_paste_monitor() {
         descriptor: *const BlockDescriptor,
     }
 
-    // SAFETY: the block is never mutated after creation and lives for the entire
-    // process lifetime.
     unsafe impl Sync for GlobalBlock {}
     unsafe impl Send for GlobalBlock {}
 
-    unsafe extern "C" fn invoke(
-        _block: *const GlobalBlock,
-        event: *mut Object,
-    ) -> *mut Object {
+    unsafe extern "C" fn invoke(_block: *const GlobalBlock, event: *mut Object) -> *mut Object {
         let flags: u64 = msg_send![event, modifierFlags];
         let keycode: u16 = msg_send![event, keyCode];
-        // kVK_ANSI_V = 9   NSEventModifierFlagCommand = 1 << 20 = 0x100000
         if keycode == 9 && (flags & 0x100000) != 0 {
             CMD_V_PRESSED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -69,7 +52,7 @@ pub(crate) fn install_paste_monitor() {
     let block = BLOCK.get_or_init(|| unsafe {
         GlobalBlock {
             isa: &_NSConcreteGlobalBlock as *const _ as *const std::ffi::c_void,
-            flags: 0x10000000i32, // BLOCK_IS_GLOBAL
+            flags: 0x10000000i32,
             reserved: 0,
             invoke,
             descriptor: &DESCRIPTOR,
@@ -77,13 +60,11 @@ pub(crate) fn install_paste_monitor() {
     });
 
     unsafe {
-        // NSEventMaskKeyDown = 1 << 10
         let monitor: *mut Object = msg_send![
             class!(NSEvent),
             addLocalMonitorForEventsMatchingMask: (1u64 << 10)
             handler: block as *const GlobalBlock
         ];
-        // The monitor is retained internally by NSEvent for the app lifetime.
         let _ = monitor;
     }
 }
@@ -91,10 +72,12 @@ pub(crate) fn install_paste_monitor() {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn install_paste_monitor() {}
 
+pub(crate) fn take_cmd_v_pressed() -> bool {
+    CMD_V_PRESSED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn read_clipboard() -> Option<String> {
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
     unsafe {
         let pasteboard: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
         if pasteboard.is_null() {
@@ -123,12 +106,8 @@ pub(crate) fn read_clipboard() -> Option<String> {
     None
 }
 
-/// Save clipboard image to ~/Desktop/pasted-image-{ts}.png.
-/// Logs every step into `log` so failures are visible in the debug window.
 #[cfg(target_os = "macos")]
 pub(crate) fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
-    use objc::runtime::Object;
-    use objc::{class, msg_send, sel, sel_impl};
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -152,7 +131,6 @@ pub(crate) fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
         }
         log.push("img_paste: NSPasteboard OK".to_owned());
 
-        // Log available pasteboard types
         let types: *mut Object = msg_send![pasteboard, types];
         if !types.is_null() {
             let count: usize = msg_send![types, count];
@@ -171,7 +149,6 @@ pub(crate) fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
             log.push("img_paste: pasteboard.types is NULL".to_owned());
         }
 
-        // Try NSImage initWithPasteboard
         let image_alloc: *mut Object = msg_send![class!(NSImage), alloc];
         log.push(format!("img_paste: NSImage alloc = {:p}", image_alloc));
         let image: *mut Object = msg_send![image_alloc, initWithPasteboard: pasteboard];
@@ -211,7 +188,6 @@ pub(crate) fn save_clipboard_image(log: &mut Vec<String>) -> Option<PathBuf> {
         }
         log.push("img_paste: NSBitmapImageRep OK".to_owned());
 
-        // NSBitmapImageFileTypePNG = 4
         let props: *mut Object = msg_send![class!(NSDictionary), dictionary];
         let png_data: *mut Object =
             msg_send![rep, representationUsingType: 4usize properties: props];

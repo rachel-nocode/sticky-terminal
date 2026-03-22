@@ -1,2 +1,2 @@
-// Sidebar rendering is invoked inline from update() in ui/mod.rs.
-// Helper methods (note_surface_frame, note_action_button) live in ui/mod.rs.
+// Sidebar rendering is handled in ui/mod.rs via GhostStickiesApp::update()
+// This file is reserved for future sidebar utilities.

@@ -14,6 +14,7 @@ default = []
 cargo-clippy = []
 
 [dependencies]
+anyhow = "1.0"
 eframe = "0.33.3"
 egui_extras = { version = "0.33.3", features = ["image"] }
 portable-pty = "0.9.0"

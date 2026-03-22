@@ -1321,6 +1321,7 @@ dependencies = [
 name = "ghost_stickies"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "eframe",
  "egui_extras",
  "objc",

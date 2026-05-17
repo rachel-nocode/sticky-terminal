@@ -3,9 +3,8 @@
 use eframe::egui;
 
 mod config;
-mod notes;
+mod sticky;
 mod theme;
-mod watcher;
 mod terminal;
 mod ui;
 
@@ -15,10 +14,13 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
+            .with_inner_size([340.0, 380.0])
+            .with_min_inner_size([200.0, 64.0])
             .with_title("StickyTerminal")
             .with_transparent(true)
             .with_decorations(false)
+            .with_resizable(true)
+            .with_always_on_top()
             .with_icon(icon),
         ..Default::default()
     };

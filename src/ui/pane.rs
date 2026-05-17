@@ -1,8 +1,7 @@
 use eframe::egui;
 use std::path::Path;
 
-use crate::terminal::{AiLineCategory, AiOutputPane, BrowserPane, Pane, TerminalPane};
-use crate::terminal::shell_escape_path;
+use crate::terminal::{shell_escape_path, TerminalPane};
 use crate::theme::ThemePalette;
 
 pub(crate) fn render_pane(
@@ -191,16 +190,7 @@ pub(crate) fn render_pane(
         pane.handle_input(ctx);
 
         let painter = ui.painter_at(rect);
-
-        if is_active {
-            painter.rect(
-                rect.shrink(0.5),
-                egui::CornerRadius::same(6),
-                egui::Color32::TRANSPARENT,
-                egui::Stroke::new(1.0, palette.accent.linear_multiply(0.3)),
-                egui::StrokeKind::Inside,
-            );
-        }
+        let _ = is_active;
 
         if max_scrollback > 0 {
             let scrollback_offset = pane.scrollback_position();
@@ -361,22 +351,23 @@ pub(crate) fn render_pane(
         }
 
         let (cursor_row, cursor_col) = screen.cursor_position();
-        if pane.has_focus {
-            let x = content_rect.left() + inner_padding + cursor_col as f32 * char_width;
-            let y = content_rect.top() + inner_padding + cursor_row as f32 * row_height;
-            let cursor_rect = egui::Rect::from_min_size(
-                egui::pos2(x, y),
-                egui::vec2(2.0, (row_height - 2.0).max(12.0)),
-            );
-            painter.rect_filled(cursor_rect, egui::CornerRadius::same(1), palette.accent);
-        } else {
-            painter.text(
-                content_rect.right_top() + egui::vec2(-10.0, 6.0),
-                egui::Align2::RIGHT_TOP,
-                "click to focus",
-                egui::TextStyle::Small.resolve(ui.style()),
-                palette.muted_text,
-            );
+        let viewing_scrollback = pane.scrollback_position() > 0;
+        if pane.has_focus && !viewing_scrollback {
+            // Blink ~1.7 Hz; solid while scrolled out of view is suppressed above.
+            let blink_on = (ctx.input(|i| i.time) * 1.7).rem_euclid(2.0) < 1.0;
+            if blink_on {
+                let x = content_rect.left() + inner_padding + cursor_col as f32 * char_width;
+                let y = content_rect.top() + inner_padding + cursor_row as f32 * row_height;
+                let cursor_rect = egui::Rect::from_min_size(
+                    egui::pos2(x, y),
+                    egui::vec2(char_width.max(2.0), (row_height - 2.0).max(12.0)),
+                );
+                painter.rect_filled(
+                    cursor_rect,
+                    egui::CornerRadius::same(1),
+                    palette.accent.linear_multiply(0.55),
+                );
+            }
         }
 
         if is_drop_target && !hovered_files.is_empty() {
@@ -460,132 +451,6 @@ pub(crate) fn render_pane(
     });
 }
 
-pub(crate) fn render_ai_output_pane(
-    pane: &mut AiOutputPane,
-    ui: &mut egui::Ui,
-    palette: ThemePalette,
-    is_active: bool,
-) {
-    let frame = egui::Frame::NONE
-        .fill(palette.terminal_bg)
-        .stroke(egui::Stroke::new(
-            if is_active { 1.5 } else { 0.5 },
-            if is_active { palette.accent } else { palette.border },
-        ))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::same(0));
-
-    frame.show(ui, |ui| {
-        let title_rect =
-            egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(ui.available_width(), 24.0));
-        ui.allocate_rect(title_rect, egui::Sense::hover());
-        ui.painter()
-            .rect_filled(title_rect, egui::CornerRadius::same(6), palette.tab_bg);
-        ui.painter().text(
-            title_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("AI: {}", pane.title),
-            egui::FontId::proportional(12.0),
-            palette.text,
-        );
-
-        let content_rect = egui::Rect::from_min_max(
-            egui::pos2(ui.min_rect().min.x, ui.min_rect().min.y + 24.0),
-            ui.min_rect().max,
-        );
-        ui.allocate_rect(content_rect, egui::Sense::hover());
-
-        let mut child_ui =
-            ui.new_child(egui::UiBuilder::new().max_rect(content_rect));
-        egui::ScrollArea::vertical()
-            .id_salt(format!("ai_scroll_{}", pane.uid))
-            .stick_to_bottom(true)
-            .show(&mut child_ui, |ui| {
-                for line in &pane.lines {
-                    let color = match line.cat {
-                        AiLineCategory::Tool => egui::Color32::from_rgb(100, 200, 255),
-                        AiLineCategory::Edit => egui::Color32::from_rgb(100, 255, 150),
-                        AiLineCategory::Bash => egui::Color32::from_rgb(255, 220, 100),
-                        AiLineCategory::Error => egui::Color32::from_rgb(255, 100, 100),
-                        AiLineCategory::Normal => palette.text,
-                    };
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&line.text)
-                                .color(color)
-                                .monospace()
-                                .size(12.0),
-                        )
-                        .wrap_mode(egui::TextWrapMode::Wrap),
-                    );
-                }
-            });
-    });
-}
-
-pub(crate) fn render_browser_pane(
-    pane: &mut BrowserPane,
-    ui: &mut egui::Ui,
-    palette: ThemePalette,
-) {
-    let frame = egui::Frame::NONE
-        .fill(egui::Color32::from_rgb(30, 30, 36))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::same(6));
-    frame.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("URL:").color(palette.muted_text).small());
-            ui.add(
-                egui::TextEdit::singleline(&mut pane.url_bar)
-                    .desired_width(ui.available_width() - 60.0)
-                    .hint_text("https://..."),
-            );
-            if ui.button("Go").clicked() {
-                pane.current_url = if pane.url_bar.starts_with("http://")
-                    || pane.url_bar.starts_with("https://")
-                    || pane.url_bar.starts_with("about:")
-                {
-                    pane.url_bar.clone()
-                } else {
-                    format!("https://{}", pane.url_bar)
-                };
-            }
-        });
-        let rect = ui.available_rect_before_wrap();
-        ui.allocate_rect(rect, egui::Sense::hover());
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(4),
-            egui::Color32::from_rgb(20, 20, 26),
-        );
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("Browser\n{}", pane.current_url),
-            egui::FontId::proportional(14.0),
-            palette.muted_text,
-        );
-    });
-}
-
-/// Dispatch rendering to the correct pane type
-pub(crate) fn render_pane_dispatch(
-    pane: &mut Pane,
-    ui: &mut egui::Ui,
-    palette: ThemePalette,
-    ctx: &egui::Context,
-    pane_id: egui::Id,
-    is_active: bool,
-) {
-    match pane {
-        Pane::Terminal(t) => render_pane(t, ui, palette, ctx, pane_id, is_active),
-        Pane::AiOutput(a) => render_ai_output_pane(a, ui, palette, is_active),
-        Pane::Browser(b) => render_browser_pane(b, ui, palette),
-    }
-}
-
-// ── URL / helper functions ──
-
 pub(crate) fn find_row_url_spans(
     screen: &vt100::Screen,
     row: u16,
@@ -660,23 +525,25 @@ pub(crate) fn open_url(url: &str) {
 }
 
 fn ansi_index_color(index: u8) -> egui::Color32 {
+    // Curated ANSI 16 — modern Tailwind-based palette ported from Terax, tuned
+    // for a dark surface so terminal output reads crisp and current.
     match index {
-        0 => egui::Color32::from_rgb(0, 0, 0),
-        1 => egui::Color32::from_rgb(205, 49, 49),
-        2 => egui::Color32::from_rgb(13, 188, 121),
-        3 => egui::Color32::from_rgb(229, 229, 16),
-        4 => egui::Color32::from_rgb(36, 114, 200),
-        5 => egui::Color32::from_rgb(188, 63, 188),
-        6 => egui::Color32::from_rgb(17, 168, 205),
-        7 => egui::Color32::from_rgb(229, 229, 229),
-        8 => egui::Color32::from_rgb(102, 102, 102),
-        9 => egui::Color32::from_rgb(241, 76, 76),
-        10 => egui::Color32::from_rgb(35, 209, 139),
-        11 => egui::Color32::from_rgb(245, 245, 67),
-        12 => egui::Color32::from_rgb(59, 142, 234),
-        13 => egui::Color32::from_rgb(214, 112, 214),
-        14 => egui::Color32::from_rgb(41, 184, 219),
-        15 => egui::Color32::from_rgb(255, 255, 255),
+        0 => egui::Color32::from_rgb(24, 24, 27),
+        1 => egui::Color32::from_rgb(239, 68, 68),
+        2 => egui::Color32::from_rgb(34, 197, 94),
+        3 => egui::Color32::from_rgb(234, 179, 8),
+        4 => egui::Color32::from_rgb(59, 130, 246),
+        5 => egui::Color32::from_rgb(168, 85, 247),
+        6 => egui::Color32::from_rgb(6, 182, 212),
+        7 => egui::Color32::from_rgb(228, 228, 231),
+        8 => egui::Color32::from_rgb(82, 82, 91),
+        9 => egui::Color32::from_rgb(248, 113, 113),
+        10 => egui::Color32::from_rgb(74, 222, 128),
+        11 => egui::Color32::from_rgb(250, 204, 21),
+        12 => egui::Color32::from_rgb(96, 165, 250),
+        13 => egui::Color32::from_rgb(192, 132, 252),
+        14 => egui::Color32::from_rgb(34, 211, 238),
+        15 => egui::Color32::from_rgb(250, 250, 250),
         16..=231 => {
             let value = index - 16;
             let r = value / 36;

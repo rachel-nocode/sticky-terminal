@@ -2,7 +2,6 @@ pub(crate) mod clipboard;
 
 use eframe::egui;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -18,126 +17,9 @@ pub(crate) struct TerminalPoint {
     pub(crate) col: u16,
 }
 
-// ── AI Output Pane types ──
-
-pub(crate) struct AiOutputPane {
-    pub(crate) uid: u64,
-    pub(crate) title: String,
-    pub(crate) lines: VecDeque<AiLine>,
-    pub(crate) mirror_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    pub(crate) source_pane_uid: u64,
-}
-
-#[derive(Clone)]
-pub(crate) struct AiLine {
-    pub(crate) text: String,
-    pub(crate) cat: AiLineCategory,
-}
-
-#[derive(Clone, PartialEq)]
-pub(crate) enum AiLineCategory {
-    Tool,
-    Edit,
-    Bash,
-    Error,
-    Normal,
-}
-
-impl AiOutputPane {
-    pub(crate) fn drain(&mut self) -> bool {
-        let mut got = false;
-        while let Ok(bytes) = self.mirror_rx.try_recv() {
-            got = true;
-            let clean = strip_ansi(&bytes);
-            for line in clean.split('\n') {
-                let text = line.trim_end_matches('\r').to_owned();
-                if text.is_empty() {
-                    continue;
-                }
-                let cat = classify_ai_line(&text);
-                self.lines.push_back(AiLine { text, cat });
-                if self.lines.len() > 5000 {
-                    self.lines.pop_front();
-                }
-            }
-        }
-        got
-    }
-}
-
-// ── Browser Pane (Feature 8 stub) ──
-
-pub(crate) struct BrowserPane {
-    pub(crate) uid: u64,
-    pub(crate) url_bar: String,
-    pub(crate) current_url: String,
-}
-
-impl BrowserPane {
-    pub(crate) fn new(uid: u64) -> Self {
-        Self {
-            uid,
-            url_bar: "about:blank".to_owned(),
-            current_url: "about:blank".to_owned(),
-        }
-    }
-}
-
-// ── Pane enum ──
-
-pub(crate) enum Pane {
-    Terminal(TerminalPane),
-    AiOutput(AiOutputPane),
-    Browser(BrowserPane),
-}
-
-impl Pane {
-    pub(crate) fn as_terminal(&self) -> Option<&TerminalPane> {
-        if let Pane::Terminal(p) = self { Some(p) } else { None }
-    }
-    pub(crate) fn as_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
-        if let Pane::Terminal(p) = self { Some(p) } else { None }
-    }
-    pub(crate) fn as_ai_output_mut(&mut self) -> Option<&mut AiOutputPane> {
-        if let Pane::AiOutput(p) = self { Some(p) } else { None }
-    }
-    pub(crate) fn drain_output(&mut self) -> bool {
-        match self {
-            Pane::Terminal(p) => p.drain_output(),
-            Pane::AiOutput(p) => p.drain(),
-            Pane::Browser(_) => false,
-        }
-    }
-    pub(crate) fn ensure_started(&mut self) {
-        if let Pane::Terminal(p) = self { p.ensure_started(); }
-    }
-    pub(crate) fn uid(&self) -> u64 {
-        match self {
-            Pane::Terminal(p) => p.uid,
-            Pane::AiOutput(p) => p.uid,
-            Pane::Browser(b) => b.uid,
-        }
-    }
-    pub(crate) fn title(&self) -> &str {
-        match self {
-            Pane::Terminal(p) => &p.title,
-            Pane::AiOutput(p) => &p.title,
-            Pane::Browser(_) => "Browser",
-        }
-    }
-    pub(crate) fn has_focus(&self) -> bool {
-        match self {
-            Pane::Terminal(p) => p.has_focus,
-            _ => false,
-        }
-    }
-}
-
 // ── A single terminal session (pane) ──
 
 pub(crate) struct TerminalPane {
-    pub(crate) uid: u64,
-    pub(crate) title: String,
     pub(crate) cwd: PathBuf,
     pub(crate) parser: Parser,
     pub(crate) rx: Option<Receiver<Vec<u8>>>,
@@ -153,16 +35,23 @@ pub(crate) struct TerminalPane {
     pub(crate) pending_logs: Vec<String>,
     pub(crate) mirror_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     pub(crate) detected_port: Option<u16>,
+    // ── Shell integration (OSC 133 / OSC 7) ──
+    /// True between a command's preexec (`133;C`) and its completion (`133;D`).
+    pub(crate) command_running: bool,
+    /// Exit code of the last finished command, parsed from `133;D;<code>`.
+    pub(crate) last_exit: Option<i32>,
+    /// Live cwd reported by the shell via OSC 7.
+    pub(crate) live_cwd: Option<PathBuf>,
+    /// Carry buffer for OSC sequences split across PTY reads.
+    osc_buf: Vec<u8>,
 }
 
 impl TerminalPane {
-    pub(crate) fn new(uid: u64, cwd: PathBuf) -> Self {
+    pub(crate) fn new(cwd: PathBuf) -> Self {
         let rows = 28;
         let cols = 120;
 
         Self {
-            uid,
-            title: String::new(),
             cwd,
             parser: Parser::new(rows, cols, TERMINAL_SCROLLBACK),
             rx: None,
@@ -178,6 +67,79 @@ impl TerminalPane {
             pending_logs: Vec::new(),
             mirror_tx: None,
             detected_port: None,
+            command_running: false,
+            last_exit: None,
+            live_cwd: None,
+            osc_buf: Vec::new(),
+        }
+    }
+
+    /// Scan PTY output for OSC 133 (command boundaries) and OSC 7 (cwd).
+    /// vt100 ignores these sequences, so we parse them ourselves.
+    fn scan_osc(&mut self, bytes: &[u8]) {
+        self.osc_buf.extend_from_slice(bytes);
+        if self.osc_buf.len() > 8192 {
+            let drop = self.osc_buf.len() - 1024;
+            self.osc_buf.drain(..drop);
+        }
+        loop {
+            let Some(start) = self
+                .osc_buf
+                .windows(2)
+                .position(|w| w == [0x1b, b']'])
+            else {
+                // No OSC introducer — keep only a trailing lone ESC.
+                let keep_esc = self.osc_buf.last() == Some(&0x1b);
+                self.osc_buf.clear();
+                if keep_esc {
+                    self.osc_buf.push(0x1b);
+                }
+                break;
+            };
+            let body = &self.osc_buf[start + 2..];
+            let term = body
+                .iter()
+                .position(|&b| b == 0x07)
+                .map(|p| (p, 1usize))
+                .or_else(|| {
+                    body.windows(2)
+                        .position(|w| w == [0x1b, b'\\'])
+                        .map(|p| (p, 2usize))
+                });
+            let Some((rel_end, term_len)) = term else {
+                // Incomplete sequence — wait for the rest.
+                self.osc_buf.drain(..start);
+                break;
+            };
+            let payload = body[..rel_end].to_vec();
+            self.handle_osc(&payload);
+            let consumed = start + 2 + rel_end + term_len;
+            self.osc_buf.drain(..consumed);
+        }
+    }
+
+    fn handle_osc(&mut self, payload: &[u8]) {
+        let Ok(s) = std::str::from_utf8(payload) else {
+            return;
+        };
+        if let Some(rest) = s.strip_prefix("133;") {
+            match rest.as_bytes().first() {
+                Some(b'C') => self.command_running = true,
+                Some(b'D') => {
+                    self.command_running = false;
+                    if let Some(code) = rest.strip_prefix("D;") {
+                        self.last_exit = code.trim().parse().ok();
+                    }
+                }
+                _ => {}
+            }
+        } else if let Some(rest) = s.strip_prefix("7;") {
+            if let Some(url) = rest.strip_prefix("file://") {
+                // Drop the host component; keep the absolute path.
+                if let Some(slash) = url.find('/') {
+                    self.live_cwd = Some(PathBuf::from(percent_decode(&url[slash..])));
+                }
+            }
         }
     }
 
@@ -192,11 +154,24 @@ impl TerminalPane {
         #[cfg(not(target_os = "windows"))]
         {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_owned());
-            let mut command = CommandBuilder::new(shell);
+            let mut command = CommandBuilder::new(&shell);
             command.arg("-il");
             command.cwd(self.cwd.as_os_str());
             command.env("TERM", "xterm-256color");
             command.env("COLORTERM", "truecolor");
+
+            // zsh: inject OSC 133 / OSC 7 shell integration via a temp ZDOTDIR.
+            if shell.rsplit('/').next() == Some("zsh") {
+                if let Some(dir) = ensure_zsh_integration() {
+                    let user_zdotdir = std::env::var("ZDOTDIR")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| std::env::var("HOME").ok())
+                        .unwrap_or_default();
+                    command.env("USER_ZDOTDIR", user_zdotdir);
+                    command.env("ZDOTDIR", dir);
+                }
+            }
             command
         }
     }
@@ -295,21 +270,25 @@ impl TerminalPane {
     }
 
     pub(crate) fn drain_output(&mut self) -> bool {
-        let mut received_output = false;
-
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
         if let Some(rx) = &self.rx {
             while let Ok(bytes) = rx.try_recv() {
-                self.parser.process(&bytes);
-                if let Some(tx) = &self.mirror_tx {
-                    let _ = tx.try_send(bytes.clone());
-                }
-                if let Ok(text) = std::str::from_utf8(&bytes) {
-                    if let Some(port) = detect_dev_server_port(text) {
-                        self.detected_port = Some(port);
-                    }
-                }
-                received_output = true;
+                chunks.push(bytes);
             }
+        }
+
+        let received_output = !chunks.is_empty();
+        for bytes in &chunks {
+            self.parser.process(bytes);
+            if let Some(tx) = &self.mirror_tx {
+                let _ = tx.try_send(bytes.clone());
+            }
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                if let Some(port) = detect_dev_server_port(text) {
+                    self.detected_port = Some(port);
+                }
+            }
+            self.scan_osc(bytes);
         }
 
         if let Some(child) = self.child.as_mut() {
@@ -713,21 +692,6 @@ impl Drop for TerminalPane {
     }
 }
 
-// ── TerminalTab ──
-
-pub(crate) struct TerminalTab {
-    pub(crate) title: String,
-    pub(crate) panes: Vec<Pane>,
-    pub(crate) active_pane: usize,
-    pub(crate) notes_markdown: String,
-    pub(crate) notes_render_cache: Option<String>,
-    pub(crate) current_note_file: Option<PathBuf>,
-    pub(crate) note_status: String,
-    pub(crate) editing_notes: bool,
-    pub(crate) notes_dirty: bool,
-    pub(crate) last_type_time: Option<std::time::Instant>,
-}
-
 pub(crate) fn default_terminal_cwd() -> PathBuf {
     let home_dir = std::env::var_os("HOME").map(PathBuf::from);
 
@@ -744,98 +708,6 @@ pub(crate) fn default_terminal_cwd() -> PathBuf {
     }
 
     home_dir.unwrap_or_else(|| PathBuf::from("."))
-}
-
-impl TerminalTab {
-    pub(crate) fn new(number: usize, uid: u64, cwd: PathBuf) -> Self {
-        Self {
-            title: format!("Tab {number}"),
-            panes: vec![Pane::Terminal(TerminalPane::new(uid, cwd))],
-            active_pane: 0,
-            notes_markdown: "# TODO\n- [ ] Keep this shell usable for Codex CLI\n- [ ] Add quick project tabs\n- [ ] Save notes between sessions\n\n## Notes\nWrite markdown on the left.\nUse the right side like a real terminal.".to_owned(),
-            notes_render_cache: None,
-            current_note_file: None,
-            note_status: "Set your notes folder to start saving notes.".to_owned(),
-            editing_notes: false,
-            notes_dirty: false,
-            last_type_time: None,
-        }
-    }
-
-    pub(crate) fn active_pane_ref(&self) -> &Pane {
-        &self.panes[self.active_pane]
-    }
-
-    pub(crate) fn active_pane_mut(&mut self) -> &mut Pane {
-        &mut self.panes[self.active_pane]
-    }
-
-    pub(crate) fn split_pane(&mut self, uid: u64) {
-        let cwd = self.panes[self.active_pane]
-            .as_terminal()
-            .map(|t| t.cwd.clone())
-            .unwrap_or_else(default_terminal_cwd);
-        let insert_at = self.active_pane + 1;
-        self.panes
-            .insert(insert_at, Pane::Terminal(TerminalPane::new(uid, cwd)));
-        self.active_pane = insert_at;
-    }
-
-    pub(crate) fn close_active_pane(&mut self) -> bool {
-        if self.panes.len() <= 1 {
-            return false;
-        }
-        self.panes.remove(self.active_pane);
-        if self.active_pane >= self.panes.len() {
-            self.active_pane = self.panes.len() - 1;
-        }
-        true
-    }
-
-    pub(crate) fn close_pane(&mut self, idx: usize) -> bool {
-        if self.panes.len() <= 1 || idx >= self.panes.len() {
-            return false;
-        }
-        self.panes.remove(idx);
-        if self.active_pane >= self.panes.len() {
-            self.active_pane = self.panes.len() - 1;
-        } else if self.active_pane > idx {
-            self.active_pane -= 1;
-        }
-        true
-    }
-
-    pub(crate) fn focus_next_pane(&mut self) {
-        if self.panes.len() > 1 {
-            self.active_pane = (self.active_pane + 1) % self.panes.len();
-        }
-    }
-
-    pub(crate) fn focus_prev_pane(&mut self) {
-        if self.panes.len() > 1 {
-            self.active_pane = if self.active_pane == 0 {
-                self.panes.len() - 1
-            } else {
-                self.active_pane - 1
-            };
-        }
-    }
-
-    pub(crate) fn ensure_all_started(&mut self) {
-        for pane in &mut self.panes {
-            pane.ensure_started();
-        }
-    }
-
-    pub(crate) fn drain_all_output(&mut self) -> bool {
-        let mut any = false;
-        for pane in &mut self.panes {
-            if pane.drain_output() {
-                any = true;
-            }
-        }
-        any
-    }
 }
 
 // ── Helper free functions ──
@@ -864,44 +736,139 @@ pub(crate) fn detect_dev_server_port(text: &str) -> Option<u16> {
     None
 }
 
-fn strip_ansi(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            i += 2;
-            while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
-                i += 1;
-            }
-            if i < bytes.len() {
-                i += 1;
-            }
-        } else {
-            if let Ok(ch) = std::str::from_utf8(&bytes[i..i + 1]) {
-                out.push_str(ch);
-            }
-            i += 1;
-        }
-    }
-    out
-}
-
-fn classify_ai_line(line: &str) -> AiLineCategory {
-    if line.contains("[TOOL]") {
-        AiLineCategory::Tool
-    } else if line.contains("[EDIT]") || line.contains("Writing") || line.contains("Editing") {
-        AiLineCategory::Edit
-    } else if line.contains("[BASH]") || line.contains("Running") || line.contains("Executing") {
-        AiLineCategory::Bash
-    } else if line.contains("[ERROR]") || line.contains("Error") || line.contains("error") {
-        AiLineCategory::Error
-    } else {
-        AiLineCategory::Normal
-    }
-}
-
 pub(crate) fn shell_escape_path(path: &std::path::Path) -> String {
     let display = path.to_string_lossy();
     let escaped = display.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+/// Decode `%XX` escapes in an OSC 7 file URL path.
+pub(crate) fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Directory holding the injected zsh startup files for shell integration.
+fn shell_init_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("StickyTerminal")
+            .join("shell-init"),
+    )
+}
+
+/// Write the temp ZDOTDIR files that emit OSC 133 (command boundaries) and
+/// OSC 7 (cwd). Each file first sources the user's real equivalent so their
+/// environment is untouched. Idempotent — rewritten every launch. Returns the
+/// directory to point `ZDOTDIR` at, or `None` if it can't be created.
+fn ensure_zsh_integration() -> Option<PathBuf> {
+    let dir = shell_init_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+
+    let source_user = |name: &str| {
+        format!("[ -f \"${{USER_ZDOTDIR:-$HOME}}/{name}\" ] && . \"${{USER_ZDOTDIR:-$HOME}}/{name}\"\n")
+    };
+
+    let zshrc = format!(
+        "{}\n# StickyTerminal shell integration — OSC 133 command boundaries + OSC 7 cwd.\n\
+         __sticky_precmd() {{\n\
+         \x20 local ec=$?\n\
+         \x20 printf '\\033]133;D;%s\\007' \"$ec\"\n\
+         \x20 printf '\\033]7;file://%s%s\\007' \"${{HOST}}\" \"${{PWD}}\"\n\
+         \x20 printf '\\033]133;A\\007'\n\
+         }}\n\
+         __sticky_preexec() {{ printf '\\033]133;C\\007'; }}\n\
+         autoload -Uz add-zsh-hook 2>/dev/null\n\
+         if (( $+functions[add-zsh-hook] )); then\n\
+         \x20 add-zsh-hook precmd __sticky_precmd\n\
+         \x20 add-zsh-hook preexec __sticky_preexec\n\
+         fi\n\
+         ZDOTDIR=\"${{USER_ZDOTDIR:-$HOME}}\"\n",
+        source_user(".zshrc"),
+    );
+
+    std::fs::write(dir.join(".zshenv"), source_user(".zshenv")).ok()?;
+    std::fs::write(dir.join(".zprofile"), source_user(".zprofile")).ok()?;
+    std::fs::write(dir.join(".zlogin"), source_user(".zlogin")).ok()?;
+    std::fs::write(dir.join(".zshrc"), zshrc).ok()?;
+
+    Some(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn detects_dev_server_ports_from_common_messages() {
+        assert_eq!(detect_dev_server_port("Listening on :3000"), Some(3000));
+        assert_eq!(detect_dev_server_port("ready at http://localhost:8787"), Some(8787));
+        assert_eq!(detect_dev_server_port("Server running on port 5173"), Some(5173));
+    }
+
+    #[test]
+    fn ignores_missing_or_invalid_ports() {
+        assert_eq!(detect_dev_server_port("Listening on :0"), None);
+        assert_eq!(detect_dev_server_port("no local server here"), None);
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes() {
+        assert_eq!(percent_decode("/Users/me/My%20Code"), "/Users/me/My Code");
+        assert_eq!(percent_decode("/plain/path"), "/plain/path");
+    }
+
+    #[test]
+    fn scan_osc_tracks_command_status() {
+        let mut pane = TerminalPane::new(PathBuf::from("/"));
+        pane.scan_osc(b"\x1b]133;C\x07");
+        assert!(pane.command_running);
+        pane.scan_osc(b"output\x1b]133;D;0\x07more");
+        assert!(!pane.command_running);
+        assert_eq!(pane.last_exit, Some(0));
+        pane.scan_osc(b"\x1b]133;D;1\x07");
+        assert_eq!(pane.last_exit, Some(1));
+    }
+
+    #[test]
+    fn scan_osc_reassembles_split_sequence() {
+        let mut pane = TerminalPane::new(PathBuf::from("/"));
+        pane.scan_osc(b"\x1b]133;D");
+        pane.scan_osc(b";0\x07");
+        assert_eq!(pane.last_exit, Some(0));
+    }
+
+    #[test]
+    fn scan_osc_reads_cwd_from_osc7() {
+        let mut pane = TerminalPane::new(PathBuf::from("/"));
+        pane.scan_osc(b"\x1b]7;file://host/Users/me/proj\x07");
+        assert_eq!(pane.live_cwd, Some(PathBuf::from("/Users/me/proj")));
+    }
+
+    #[test]
+    fn escapes_shell_paths_with_single_quotes() {
+        assert_eq!(
+            shell_escape_path(Path::new("/tmp/it's here")),
+            "'/tmp/it'\\''s here'"
+        );
+    }
 }

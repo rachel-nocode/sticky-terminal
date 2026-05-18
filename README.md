@@ -1,159 +1,128 @@
-# StickyTerminal
+<div align="center">
 
-StickyTerminal is a desktop app that combines:
+<img src="assets/sticky-mascot.svg" alt="Sticky the mascot" width="150">
 
-- a real terminal on the right
-- markdown notes on the left
+# Sticky Terminal
 
-The goal is to make it easy to work in tools like Codex CLI while keeping notes, todos, and project thoughts in the same window.
+**A tiny always-on-top terminal that looks like a paper sticky note.**
 
-## What it does
+Stick a real shell anywhere on your screen. It's small, it's cute, it stays on top,
+and it's a fun little Rust project you can crack open and make your own.
 
-- runs a live shell inside the app
-- supports multiple terminal tabs
-- lets you drag to reorder tabs
-- supports tab rename and close from the context menu
-- lets you drag files or folders into the terminal to paste their paths
-- gives you a collapsible notes sidebar
-- saves notes into a `StickyTerminal` folder you choose
-- renders markdown previews in the notes panel
-- supports privacy mode for screen sharing on macOS
-- starts the shell as a login shell on macOS so commands like `codex` use your normal PATH
-- includes custom app icons for runtime and macOS app bundles
+<img src="assets/screenshots/hero.png" alt="Sticky Terminal on the desktop" width="420">
 
-## Built with
+</div>
 
-- Rust
-- `eframe` / `egui`
-- `portable-pty`
-- `vt100`
-- `pulldown-cmark`
-- `rfd`
+---
 
-## Run locally
+## What it is
 
-Make sure Rust is installed, then run:
+Sticky Terminal is one window — a single paper sticky note holding one real
+terminal. No tabs, no panels, no clutter. Drag it into a corner, run your
+commands, peel it off when you're done.
+
+It's also a **template**. The whole app is ~1,400 lines of readable Rust. If
+you've ever wanted to build your own terminal app, fork this and go.
+
+## Features
+
+- 🗒️ **Looks like paper** — soft shadow, header band, folded dog-ear corner
+- 🎨 **7 pastel papers** — Lemon, Peach, Rose, Mint, Sky, Lilac, Sand. Shuffle anytime
+- 📌 **Always on top** — borderless, tiny, sticks above every other window
+- 🤏 **Minimise** — collapse the note down to just its header bar
+- 🫥 **Hide when screen sharing** — keep the sticky out of recordings (macOS)
+- 🖱️ **Drag files in** — drop a file or folder to paste its path
+- 🖼️ **Paste images** — `Cmd+V` an image and it pastes the saved file path
+- 🔗 **Cmd+click URLs** to open them
+- ⚡ Real PTY shell, scrollback, login shell on macOS so your `PATH` just works
+
+## Quick start
+
+You need [Rust](https://rustup.rs) installed. Then:
 
 ```bash
+git clone https://github.com/rachel-nocode/sticky-terminal.git
+cd sticky-terminal
 cargo run
 ```
 
-To check that the project builds:
+That's it. The sticky note pops up — drag it wherever you like.
 
-```bash
-cargo check
-```
+## Build a real app (macOS)
 
-## Build a real macOS app
-
-This repo now includes a local build script that creates a normal app bundle:
+To get a proper `StickyTerminal.app` you can keep in your Applications folder:
 
 ```bash
 ./scripts/build-macos-app.sh
 ```
 
-That will build:
+It builds `dist/StickyTerminal.app`. Drag it into `/Applications` and you're set.
 
-```bash
-dist/StickyTerminal.app
+Want a shareable installer? `./scripts/build-dmg.sh` makes a drag-to-Applications
+DMG. If you have an Apple Developer account, `./scripts/sign-and-notarize.sh`
+signs and notarizes everything (see the script headers for setup).
+
+## Keyboard shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Cmd+Shift+T` | Shuffle to a random paper colour |
+| `Cmd+Shift+P` | Toggle hide-when-screen-sharing |
+| `Cmd+V` | Paste text, or paste an image as a file path |
+| `Cmd+click` | Open a URL in the terminal |
+
+The **▾ menu** in the header has shuffle colour, hide-when-sharing, and minimise.
+Drag the **header** to move the note. Drag the **dog-ear corner** to resize.
+
+## Make it your own
+
+This repo is meant to be hacked on. See **[CUSTOMIZE.md](CUSTOMIZE.md)** for the
+easy tweak points — paper colours, fonts, window size, keybinds — with exact
+file and line pointers.
+
+## Project layout
+
+```
+src/
+  main.rs            window setup + app entry
+  config.rs          load/save the chosen paper colour
+  theme.rs           the terminal colour palette struct
+  sticky.rs          the paper-sticky chrome + dropdown menu  ← start here
+  ui/
+    mod.rs           app state, the update loop, menu wiring
+    pane.rs          the terminal grid: cells, cursor, scrollback
+  terminal/
+    mod.rs           the PTY shell + vt100 parser
+    clipboard.rs     image-paste handling
 ```
 
-You can then drag `StickyTerminal.app` into your Applications folder.
+## Vibe coder challenge
 
-Each time you want an updated app:
+Fork it and add something:
 
-1. pull or make your latest code changes
-2. run `./scripts/build-macos-app.sh`
-3. replace the old app in Applications with the new `dist/StickyTerminal.app`
+- A live clock in the header band
+- A "pin to this corner" snap
+- More paper colours (or a custom-colour picker)
+- A sound when a command finishes
+- Sticky notes that remember their position on screen
 
-If you launch the app from Finder, the terminal will start in your home folder by default.
+If you build something fun, share it — tag the repo.
 
-## Build a shareable DMG
+## Built with
 
-To make a nice installer DMG with a drag-to-Applications layout:
+[Rust](https://www.rust-lang.org) · [`eframe`/`egui`](https://github.com/emilk/egui)
+· [`portable-pty`](https://crates.io/crates/portable-pty) ·
+[`vt100`](https://crates.io/crates/vt100)
 
-```bash
-./scripts/build-dmg.sh
-```
+## Platform support
 
-That will build:
+| | macOS | Linux / Windows |
+|---|---|---|
+| Run + build | ✅ | ✅ (via `cargo run`) |
+| Hide-when-sharing | ✅ | — (macOS only) |
+| `.app` / `.dmg` scripts | ✅ | — |
 
-```bash
-dist/StickyTerminal-0.1.0.dmg
-```
+## License
 
-## Sign and notarize for sharing
-
-If you have the paid Apple Developer Program, you can sign and notarize the app properly.
-
-### 1. Install your Developer ID certificate
-
-You need this certificate in your login keychain:
-
-```text
-Developer ID Application
-```
-
-You can create and download it from your Apple Developer account, then install it by opening the downloaded certificate file on your Mac.
-
-To check if it is installed:
-
-```bash
-security find-identity -v -p codesigning
-```
-
-### 2. Save your notary credentials
-
-Create a Keychain profile for notarization:
-
-```bash
-./scripts/setup-notary-profile.sh stickyterminal-notary your-apple-id@example.com YOURTEAMID
-```
-
-Apple will prompt for an app-specific password if needed.
-
-### 3. Sign and notarize everything
-
-Then run:
-
-```bash
-./scripts/sign-and-notarize.sh
-```
-
-This script will:
-
-1. build the app
-2. sign it with your Developer ID certificate
-3. notarize the app
-4. staple the app ticket
-5. build the DMG
-6. sign the DMG
-7. notarize the DMG
-8. staple the DMG ticket
-
-## Notes
-
-When you open the notes panel:
-
-1. choose a folder
-2. StickyTerminal will use a `StickyTerminal` folder there
-3. open or create a markdown note
-4. write in one raw markdown note view
-
-## Current themes
-
-- Terminal
-- Black
-- Blue
-- Red
-
-## macOS icon assets
-
-The repo includes:
-
-- runtime app icon pngs in `assets/`
-- macOS bundle icon files in `assets/macos/`
-
-## Status
-
-This is an active personal project and the UI is still evolving.
+MIT — see [LICENSE](LICENSE). Take it, fork it, make it yours.
+Bundled fonts are under the SIL Open Font License (`assets/fonts/`).

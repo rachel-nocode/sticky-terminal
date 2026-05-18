@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 250" width="240" height="250">
+  <title>Sticky — the Sticky Terminal mascot</title>
+
+  <!-- ground shadow -->
+  <ellipse cx="120" cy="231" rx="66" ry="11" fill="#3F3A2E" opacity="0.13"/>
+
+  <!-- feet -->
+  <ellipse cx="92" cy="212" rx="15" ry="10" fill="#ECE4A8" stroke="#3F3A2E" stroke-width="3.5"/>
+  <ellipse cx="148" cy="212" rx="15" ry="10" fill="#ECE4A8" stroke="#3F3A2E" stroke-width="3.5"/>
+
+  <!-- arms -->
+  <path d="M52 122 Q34 124 25 132" fill="none" stroke="#3F3A2E" stroke-width="5" stroke-linecap="round"/>
+  <path d="M188 116 Q208 108 214 90" fill="none" stroke="#3F3A2E" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="23" cy="133" r="7.5" fill="#ECE4A8" stroke="#3F3A2E" stroke-width="3.5"/>
+  <circle cx="215" cy="88" r="7.5" fill="#ECE4A8" stroke="#3F3A2E" stroke-width="3.5"/>
+
+  <!-- paper body -->
+  <rect x="46" y="40" width="148" height="168" rx="16" fill="#ECE4A8"/>
+  <!-- header band -->
+  <path d="M46 56 Q46 40 62 40 L178 40 Q194 40 194 56 L194 70 L46 70 Z" fill="#E2D78A"/>
+  <line x1="46" y1="70" x2="194" y2="70" stroke="#3F3A2E" stroke-width="2"/>
+  <!-- header prompt mark -->
+  <text x="60" y="61" font-family="ui-monospace, Menlo, monospace" font-size="15" font-weight="700" fill="#3F3A2E">&gt;_</text>
+  <!-- body outline -->
+  <rect x="46" y="40" width="148" height="168" rx="16" fill="none" stroke="#3F3A2E" stroke-width="3.5"/>
+
+  <!-- folded dog-ear corner -->
+  <path d="M160 208 L194 174 L194 208 Z" fill="#DECF8C" stroke="#3F3A2E" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- face -->
+  <ellipse cx="81" cy="126" rx="8.5" ry="5.5" fill="#F2A98C" opacity="0.7"/>
+  <ellipse cx="159" cy="126" rx="8.5" ry="5.5" fill="#F2A98C" opacity="0.7"/>
+  <circle cx="96" cy="112" r="6.5" fill="#3F3A2E"/>
+  <circle cx="144" cy="112" r="6.5" fill="#3F3A2E"/>
+  <circle cx="98.3" cy="109.6" r="2.2" fill="#FFFFFF"/>
+  <circle cx="146.3" cy="109.6" r="2.2" fill="#FFFFFF"/>
+  <path d="M101 130 Q120 147 139 130" fill="none" stroke="#3F3A2E" stroke-width="3.6" stroke-linecap="round"/>
+</svg>

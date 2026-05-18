@@ -16,9 +16,9 @@ const MINIMIZED_H: f32 = 68.0;
 /// Window inner height needed to show the dropdown while minimized.
 const MENU_FIT_H: f32 = 188.0;
 
-/// StickyTerminal — the whole app window is a single paper sticky note holding
-/// one terminal. Tiny, borderless, always-on-top: stick it anywhere on screen.
-pub(crate) struct GhostStickiesApp {
+/// The whole app window is a single paper sticky note holding one terminal.
+/// Tiny, borderless, always-on-top: stick it anywhere on screen.
+pub(crate) struct StickyTerminalApp {
     paper: PaperColor,
     privacy_mode: bool,
     applied_privacy_mode: Option<bool>,
@@ -31,7 +31,7 @@ pub(crate) struct GhostStickiesApp {
     terminal: TerminalPane,
 }
 
-impl GhostStickiesApp {
+impl StickyTerminalApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self::install_fonts(&cc.egui_ctx);
         install_paste_monitor();
@@ -231,7 +231,7 @@ impl GhostStickiesApp {
     }
 }
 
-impl eframe::App for GhostStickiesApp {
+impl eframe::App for StickyTerminalApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Transparent — only the painted sticky card is opaque; the desktop
         // shows through around it (and under the drop shadow).

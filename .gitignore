@@ -1,5 +1,13 @@
+# Build output
 /target
 dist/
+
+# macOS / editor cruft
 .DS_Store
-.claude/settings.local.json
-.claude/worktrees/
+**/.DS_Store
+
+# Local agent / tooling config — never ship
+.claude/
+
+# Packaged giveaway zips
+sticky-terminal-template*.zip

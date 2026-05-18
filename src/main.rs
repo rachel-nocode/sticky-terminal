@@ -28,6 +28,6 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "StickyTerminal",
         options,
-        Box::new(|cc| Ok(Box::new(ui::GhostStickiesApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(ui::StickyTerminalApp::new(cc)))),
     )
 }
